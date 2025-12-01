@@ -76,6 +76,7 @@ REMOTE_EOF
 
 FORCE=false
 LOCAL_ONLY=false
+TEARDOWN_SWARM=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -87,17 +88,26 @@ while [[ $# -gt 0 ]]; do
       LOCAL_ONLY=true
       shift
       ;;
+    --teardown-swarm)
+      TEARDOWN_SWARM=true
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo ""
       echo "Options:"
-      echo "  -f, --force       Stop without confirmation"
-      echo "  -l, --local-only  Only stop containers on this node (don't SSH to workers)"
-      echo "  -h, --help        Show this help"
+      echo "  -f, --force         Stop without confirmation"
+      echo "  -l, --local-only    Only stop containers on this node (don't SSH to workers)"
+      echo "  --teardown-swarm    Also tear down Docker Swarm (workers leave, then head leaves)"
+      echo "  -h, --help          Show this help"
       echo ""
       echo "By default, this script will:"
       echo "  1. Stop containers on the head node (local)"
       echo "  2. SSH to all workers in WORKER_HOST and stop their containers"
+      echo ""
+      echo "With --teardown-swarm, it will also:"
+      echo "  3. Have all workers leave the Docker Swarm"
+      echo "  4. Have the head node leave/destroy the Swarm"
       echo ""
       exit 0
       ;;
@@ -128,6 +138,10 @@ if [ "${LOCAL_ONLY}" != "true" ] && [ ${#WORKER_HOST_ARRAY[@]} -gt 0 ]; then
   for ip in "${WORKER_HOST_ARRAY[@]}"; do
     echo "  - Worker: ${ip}"
   done
+fi
+if [ "${TEARDOWN_SWARM}" = "true" ]; then
+  echo ""
+  log "Will also tear down Docker Swarm"
 fi
 echo ""
 
@@ -194,6 +208,43 @@ for c in $(docker ps --format '{{.Names}}' | grep -E "^trtllm-" || true); do
 done
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Teardown Docker Swarm (if requested)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SWARM_TORN_DOWN=false
+
+if [ "${TEARDOWN_SWARM}" = "true" ]; then
+  # Check if swarm is active
+  if docker info 2>/dev/null | grep -q "Swarm: active"; then
+    log "Tearing down Docker Swarm..."
+
+    # First, have workers leave the swarm
+    if [ "${LOCAL_ONLY}" != "true" ] && [ ${#WORKER_HOST_ARRAY[@]} -gt 0 ]; then
+      for ip in "${WORKER_HOST_ARRAY[@]}"; do
+        log "  Having worker ${ip} leave swarm..."
+        if ssh -o ConnectTimeout=5 -o BatchMode=yes "${WORKER_USER}@${ip}" "docker swarm leave --force" 2>/dev/null; then
+          log "    Worker ${ip} left swarm"
+        else
+          log "    Warning: Could not remove ${ip} from swarm (may already be gone)"
+        fi
+      done
+    fi
+
+    # Then have the head node leave (this destroys the swarm)
+    log "  Having head node leave swarm (destroys swarm)..."
+    if docker swarm leave --force 2>/dev/null; then
+      log "    Head node left swarm"
+      SWARM_TORN_DOWN=true
+    else
+      log "    Warning: Could not leave swarm on head node"
+    fi
+  else
+    log "Docker Swarm not active, nothing to tear down"
+  fi
+  echo ""
+fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Summary
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -205,6 +256,9 @@ echo "Stopped:"
 echo "  - ${STOPPED} container(s) on head node"
 if [ "${LOCAL_ONLY}" != "true" ] && [ ${#WORKER_HOST_ARRAY[@]} -gt 0 ]; then
   echo "  - Containers on ${#WORKER_HOST_ARRAY[@]} worker node(s)"
+fi
+if [ "${SWARM_TORN_DOWN}" = "true" ]; then
+  echo "  - Docker Swarm torn down"
 fi
 echo ""
 echo "============================================================="
