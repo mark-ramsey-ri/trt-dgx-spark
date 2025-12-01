@@ -2,10 +2,16 @@
 set -euo pipefail
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# TensorRT-LLM DGX Spark Cluster - Unified Start Script
+# TensorRT-LLM DGX Spark Cluster - Docker Swarm Stack Deployment
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Starts TensorRT-LLM on both head and worker nodes from a single command.
-# Run this script on the HEAD NODE - it will SSH to workers automatically.
+# Starts TensorRT-LLM on both head and worker nodes using Docker Swarm.
+# Based on NVIDIA's recommended multi-node deployment approach.
+#
+# Prerequisites:
+#   1. Run ./setup_swarm.sh on all nodes (one-time setup)
+#   2. Ensure HF_TOKEN is set for gated models
+#
+# Run this script on the HEAD NODE.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,10 +28,8 @@ fi
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # Docker
-TRT_IMAGE="${TRT_IMAGE:-nvcr.io/nvidia/tensorrt-llm/release:1.0.0rc3}"
-HEAD_CONTAINER_NAME="${HEAD_CONTAINER_NAME:-trtllm-head}"
-WORKER_CONTAINER_NAME="${WORKER_CONTAINER_NAME:-trtllm-worker}"
-SHM_SIZE="${SHM_SIZE:-32g}"
+TRT_IMAGE="${TRT_IMAGE:-nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc4}"
+STACK_NAME="${STACK_NAME:-trtllm-multinode}"
 
 # Model
 MODEL="${MODEL:-nvidia/Qwen3-235B-A22B-FP4}"
@@ -38,8 +42,6 @@ MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-32768}"
 TRT_BACKEND="${TRT_BACKEND:-pytorch}"
 GPU_MEMORY_FRACTION="${GPU_MEMORY_FRACTION:-0.90}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-true}"
-CUDA_GRAPH_PADDING="${CUDA_GRAPH_PADDING:-true}"
-DISABLE_OVERLAP_SCHEDULER="${DISABLE_OVERLAP_SCHEDULER:-true}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 # Ports
@@ -56,27 +58,20 @@ NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-5}"
 NCCL_TIMEOUT="${NCCL_TIMEOUT:-1200}"
 
 # Worker configuration
-# WORKER_HOST: Ethernet IP for SSH access (e.g., 192.168.7.111)
-# WORKER_IB_IP: InfiniBand IP for NCCL/MPI communication (e.g., 169.254.216.8)
-# Legacy WORKER_IPS is supported for backwards compatibility
 WORKER_HOST="${WORKER_HOST:-}"
-WORKER_IB_IP="${WORKER_IB_IP:-${WORKER_IPS:-}}"  # Fallback to WORKER_IPS for backwards compat
+WORKER_IB_IP="${WORKER_IB_IP:-${WORKER_IPS:-}}"
 WORKER_USER="${WORKER_USER:-$(whoami)}"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Auto-detect Network Configuration (Head Node)
+# Auto-detect Network Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # Auto-detect HEAD_IP from InfiniBand interface
 if [ -z "${HEAD_IP:-}" ]; then
   if command -v ibdev2netdev >/dev/null 2>&1; then
     PRIMARY_IB_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | grep "^enp1" | head -1)
-    if [ -z "${PRIMARY_IB_IF}" ]; then
-      PRIMARY_IB_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | head -1)
-    fi
-    if [ -n "${PRIMARY_IB_IF}" ]; then
-      HEAD_IP=$(ip -o addr show "${PRIMARY_IB_IF}" 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | head -1)
-    fi
+    [ -z "${PRIMARY_IB_IF}" ] && PRIMARY_IB_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | head -1)
+    [ -n "${PRIMARY_IB_IF}" ] && HEAD_IP=$(ip -o addr show "${PRIMARY_IB_IF}" 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | head -1)
   fi
   if [ -z "${HEAD_IP:-}" ]; then
     echo "ERROR: Could not auto-detect HEAD_IP. Please set HEAD_IP in config.env"
@@ -85,26 +80,19 @@ if [ -z "${HEAD_IP:-}" ]; then
 fi
 
 # Auto-detect network interfaces
-if [ -z "${NCCL_SOCKET_IFNAME:-}" ] || [ -z "${GLOO_SOCKET_IFNAME:-}" ]; then
+if [ -z "${NCCL_SOCKET_IFNAME:-}" ]; then
   if command -v ibdev2netdev >/dev/null 2>&1; then
     PRIMARY_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | grep "^enp1" | head -1)
-    if [ -z "${PRIMARY_IF}" ]; then
-      PRIMARY_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | head -1)
-    fi
-    NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-${PRIMARY_IF}}"
-    GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${PRIMARY_IF}}"
+    [ -z "${PRIMARY_IF}" ] && PRIMARY_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | head -1)
+    NCCL_SOCKET_IFNAME="${PRIMARY_IF}"
+    GLOO_SOCKET_IFNAME="${PRIMARY_IF}"
   fi
 fi
 
 # Auto-detect InfiniBand HCAs
 if [ -z "${NCCL_IB_HCA:-}" ]; then
   if command -v ibdev2netdev >/dev/null 2>&1; then
-    IB_DEVICES=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $1}' | sort | tr '\n' ',' | sed 's/,$//')
-    NCCL_IB_HCA="${IB_DEVICES:-}"
-  fi
-  if [ -z "${NCCL_IB_HCA:-}" ]; then
-    IB_DEVICES=$(ls -1 /sys/class/infiniband/ 2>/dev/null | tr '\n' ',' | sed 's/,$//')
-    NCCL_IB_HCA="${IB_DEVICES:-}"
+    NCCL_IB_HCA=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $1}' | sort | tr '\n' ',' | sed 's/,$//')
   fi
 fi
 
@@ -125,42 +113,33 @@ error() {
 # Parse Arguments
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-HEAD_ONLY=false
 SKIP_PULL=false
+HEAD_ONLY=false
+SKIP_DOWNLOAD=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --head-only)
-      HEAD_ONLY=true
-      shift
-      ;;
     --skip-pull)
       SKIP_PULL=true
       shift
       ;;
-    --worker-ip|--worker-ib-ip)
-      WORKER_IB_IP="$2"
-      shift 2
+    --skip-download)
+      SKIP_DOWNLOAD=true
+      shift
       ;;
-    --worker-host)
-      WORKER_HOST="$2"
-      shift 2
+    --head-only)
+      HEAD_ONLY=true
+      NUM_NODES=1
+      shift
       ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo ""
       echo "Options:"
-      echo "  --head-only          Only start head node (don't SSH to workers)"
-      echo "  --skip-pull          Skip Docker image pull (faster restart)"
-      echo "  --worker-host IP     Worker Ethernet IP for SSH (e.g., 192.168.7.111)"
-      echo "  --worker-ib-ip IP    Worker InfiniBand IP for NCCL/MPI (e.g., 169.254.216.8)"
-      echo "  -h, --help           Show this help"
-      echo ""
-      echo "Environment variables (recommended):"
-      echo "  WORKER_HOST          Worker Ethernet IP for SSH"
-      echo "  WORKER_IB_IP         Worker InfiniBand IP for NCCL/MPI"
-      echo ""
-      echo "Configuration is read from config.env or config.local.env"
+      echo "  --skip-pull      Skip Docker image pull"
+      echo "  --skip-download  Skip model download (if already cached)"
+      echo "  --head-only      Run single-node on head only"
+      echo "  -h, --help       Show this help"
       echo ""
       exit 0
       ;;
@@ -171,57 +150,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Validate Worker Configuration
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-if [ "${HEAD_ONLY}" != "true" ] && [ "${NUM_NODES}" -gt 1 ]; then
-  if [ -z "${WORKER_IB_IP}" ]; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo " Worker Configuration Required"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    echo "This is a ${NUM_NODES}-node cluster but no worker IPs are configured."
-    echo ""
-    echo "Please set these environment variables:"
-    echo "  export WORKER_HOST=\"192.168.x.x\"    # Ethernet IP for SSH"
-    echo "  export WORKER_IB_IP=\"169.254.x.x\"   # InfiniBand IP for NCCL/MPI"
-    echo ""
-    echo "Or start head only:"
-    echo "  $0 --head-only"
-    echo ""
-    echo "To find worker IPs, run on the worker node:"
-    echo "  hostname -I                          # Shows all IPs"
-    echo "  ibdev2netdev && ip addr show <ib_if> # Shows IB interface IP"
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    exit 1
-  fi
-
-  # If WORKER_HOST not set, fall back to WORKER_IB_IP for SSH (backwards compat)
-  if [ -z "${WORKER_HOST}" ]; then
-    log "Warning: WORKER_HOST not set, using WORKER_IB_IP (${WORKER_IB_IP}) for SSH"
-    WORKER_HOST="${WORKER_IB_IP}"
-  fi
-fi
-
-# Convert WORKER_IB_IP to array (supports multiple workers: "ip1 ip2 ip3")
-read -ra WORKER_IB_IP_ARRAY <<< "${WORKER_IB_IP}"
+# Convert worker IP lists to arrays
 read -ra WORKER_HOST_ARRAY <<< "${WORKER_HOST}"
-ACTUAL_NUM_WORKERS=${#WORKER_IB_IP_ARRAY[@]}
+read -ra WORKER_IB_IP_ARRAY <<< "${WORKER_IB_IP}"
 
-if [ "${HEAD_ONLY}" != "true" ] && [ "${NUM_NODES}" -gt 1 ]; then
-  EXPECTED_WORKERS=$((NUM_NODES - 1))
-  if [ "${ACTUAL_NUM_WORKERS}" -ne "${EXPECTED_WORKERS}" ]; then
-    log "Warning: NUM_NODES=${NUM_NODES} but only ${ACTUAL_NUM_WORKERS} worker IP(s) provided"
-    log "Adjusting NUM_NODES to $((ACTUAL_NUM_WORKERS + 1))"
-    NUM_NODES=$((ACTUAL_NUM_WORKERS + 1))
-  fi
+# If WORKER_HOST is empty but WORKER_IB_IP has values, use IB IPs for SSH
+if [ ${#WORKER_HOST_ARRAY[@]} -eq 0 ] && [ ${#WORKER_IB_IP_ARRAY[@]} -gt 0 ]; then
+  log "Warning: WORKER_HOST not set, using WORKER_IB_IP (${WORKER_IB_IP}) for SSH"
+  read -ra WORKER_HOST_ARRAY <<< "${WORKER_IB_IP}"
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Main Script
+# Display Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 echo ""
@@ -240,56 +180,67 @@ log ""
 log "Network:"
 log "  Head IP:         ${HEAD_IP}"
 log "  API Port:        ${TRT_PORT}"
-if [ "${HEAD_ONLY}" != "true" ] && [ "${ACTUAL_NUM_WORKERS}" -gt 0 ]; then
-  log "  Worker Host:     ${WORKER_HOST} (SSH)"
-  log "  Worker IB IP:    ${WORKER_IB_IP} (NCCL/MPI)"
+if [ ${#WORKER_HOST_ARRAY[@]} -gt 0 ]; then
+  log "  Workers:         ${WORKER_HOST_ARRAY[*]}"
 fi
-log ""
+echo ""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Step 1: Setup tiktoken encodings (for GPT-OSS models)
+# Step 1: Setup tiktoken encodings
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 log "Step 1: Setting up tiktoken encodings"
 mkdir -p "${TIKTOKEN_DIR}"
-
-if [ ! -f "${TIKTOKEN_DIR}/o200k_base.tiktoken" ]; then
-  log "  Downloading o200k_base.tiktoken..."
-  wget -q -O "${TIKTOKEN_DIR}/o200k_base.tiktoken" \
-    "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken" || \
-    log "  Warning: Failed to download o200k_base.tiktoken"
-fi
-
-if [ ! -f "${TIKTOKEN_DIR}/cl100k_base.tiktoken" ]; then
-  log "  Downloading cl100k_base.tiktoken..."
-  wget -q -O "${TIKTOKEN_DIR}/cl100k_base.tiktoken" \
-    "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken" || \
-    log "  Warning: Failed to download cl100k_base.tiktoken"
-fi
+[ ! -f "${TIKTOKEN_DIR}/o200k_base.tiktoken" ] && wget -q -O "${TIKTOKEN_DIR}/o200k_base.tiktoken" "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken" 2>/dev/null || true
+[ ! -f "${TIKTOKEN_DIR}/cl100k_base.tiktoken" ] && wget -q -O "${TIKTOKEN_DIR}/cl100k_base.tiktoken" "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken" 2>/dev/null || true
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Step 2: Pull Docker image
+# Step 2: Verify Docker Swarm
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-if [ "${SKIP_PULL}" != "true" ]; then
-  log "Step 2: Pulling Docker image on head node"
-  docker pull "${TRT_IMAGE}" || error "Failed to pull image"
+log "Step 2: Verifying Docker Swarm"
+
+SWARM_STATUS=$(docker info 2>/dev/null | grep "Swarm:" | awk '{print $2}')
+
+if [ "${SWARM_STATUS}" = "inactive" ]; then
+  log "  Initializing Docker Swarm..."
+  docker swarm init --advertise-addr "${HEAD_IP}" 2>/dev/null || true
+
+  if [ "${HEAD_ONLY}" != "true" ] && [ ${#WORKER_HOST_ARRAY[@]} -gt 0 ]; then
+    JOIN_TOKEN=$(docker swarm join-token worker -q)
+    for i in "${!WORKER_HOST_ARRAY[@]}"; do
+      SSH_HOST="${WORKER_HOST_ARRAY[$i]}"
+      WORKER_IB="${WORKER_IB_IP_ARRAY[$i]:-${SSH_HOST}}"
+      log "  Worker ${SSH_HOST} joining swarm..."
+      ssh "${WORKER_USER}@${SSH_HOST}" "docker swarm leave --force 2>/dev/null || true"
+      ssh "${WORKER_USER}@${SSH_HOST}" "docker swarm join --token '${JOIN_TOKEN}' --advertise-addr '${WORKER_IB}' '${HEAD_IP}:2377'"
+    done
+  fi
 else
-  log "Step 2: Skipping Docker pull (--skip-pull)"
+  log "  Docker Swarm is active"
+fi
+
+# Verify nodes
+log "  Swarm nodes:"
+docker node ls --format "  {{.Hostname}}: {{.Status}}" 2>/dev/null || true
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 3: Pull Docker image
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if [ "${SKIP_PULL}" = "true" ]; then
+  log "Step 3: Skipping Docker pull (--skip-pull)"
+else
+  log "Step 3: Pulling Docker image on all nodes..."
+  docker pull "${TRT_IMAGE}" &
+  for SSH_HOST in "${WORKER_HOST_ARRAY[@]}"; do
+    ssh "${WORKER_USER}@${SSH_HOST}" "docker pull '${TRT_IMAGE}'" &
+  done
+  wait
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Step 3: Clean up old head container
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-log "Step 3: Cleaning up old containers"
-if docker ps -a --format '{{.Names}}' | grep -qx "${HEAD_CONTAINER_NAME}"; then
-  log "  Removing existing head container"
-  docker rm -f "${HEAD_CONTAINER_NAME}" >/dev/null
-fi
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Step 4: Create TensorRT-LLM API config file
+# Step 4: Create TensorRT-LLM API config
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 log "Step 4: Creating TensorRT-LLM API config"
@@ -301,246 +252,193 @@ kv_cache_config:
   dtype: "auto"
   free_gpu_memory_fraction: ${GPU_MEMORY_FRACTION}
 cuda_graph_config:
-  enable_padding: ${CUDA_GRAPH_PADDING}
-disable_overlap_scheduler: ${DISABLE_OVERLAP_SCHEDULER}
+  enable_padding: true
 EOF
 
-log "  Config written to ${TRT_CONFIG_FILE}"
+# Copy to workers
+for SSH_HOST in "${WORKER_HOST_ARRAY[@]}"; do
+  scp -q "${TRT_CONFIG_FILE}" "${WORKER_USER}@${SSH_HOST}:/tmp/trtllm-api-config.yml"
+done
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Step 5: Start workers via SSH (before head, so they're ready to connect)
+# Step 4b: Generate SSH keys for MPI communication
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-if [ "${HEAD_ONLY}" != "true" ] && [ "${ACTUAL_NUM_WORKERS}" -gt 0 ]; then
-  log "Step 5: Starting workers via SSH"
-
-  NODE_RANK=1
-  for i in "${!WORKER_IB_IP_ARRAY[@]}"; do
-    WORKER_IB="${WORKER_IB_IP_ARRAY[$i]}"
-    # Use WORKER_HOST for SSH if available, otherwise fall back to IB IP
-    SSH_HOST="${WORKER_HOST_ARRAY[$i]:-${WORKER_IB}}"
-    log "  Starting worker at ${SSH_HOST} (IB: ${WORKER_IB}, node-rank ${NODE_RANK})..."
-
-    # Test SSH connectivity
-    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "${WORKER_USER}@${SSH_HOST}" "echo ok" >/dev/null 2>&1; then
-      error "Cannot SSH to ${WORKER_USER}@${SSH_HOST}. Check SSH keys and connectivity."
-    fi
-
-    # Start worker in background via SSH
-    ssh "${WORKER_USER}@${SSH_HOST}" bash -s << WORKER_EOF &
-set -e
-
-# Configuration passed from head
-export HEAD_IP="${HEAD_IP}"
-export NODE_RANK="${NODE_RANK}"
-export MODEL="${MODEL}"
-export TENSOR_PARALLEL="${TENSOR_PARALLEL}"
-export NUM_NODES="${NUM_NODES}"
-export MAX_BATCH_SIZE="${MAX_BATCH_SIZE}"
-export MAX_NUM_TOKENS="${MAX_NUM_TOKENS}"
-export TRT_BACKEND="${TRT_BACKEND}"
-export GPU_MEMORY_FRACTION="${GPU_MEMORY_FRACTION}"
-export TRT_PORT="${TRT_PORT}"
-export HF_CACHE="${HF_CACHE}"
-export HF_TOKEN="${HF_TOKEN:-}"
-export TRT_IMAGE="${TRT_IMAGE}"
-export SHM_SIZE="${SHM_SIZE}"
-export TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE}"
-export EXTRA_ARGS="${EXTRA_ARGS}"
-export NCCL_DEBUG="${NCCL_DEBUG}"
-export NCCL_IB_DISABLE="${NCCL_IB_DISABLE}"
-export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL}"
-export NCCL_TIMEOUT="${NCCL_TIMEOUT}"
-
-# Setup tiktoken
-TIKTOKEN_DIR="\${HOME}/tiktoken_encodings"
-mkdir -p "\${TIKTOKEN_DIR}"
-[ ! -f "\${TIKTOKEN_DIR}/o200k_base.tiktoken" ] && wget -q -O "\${TIKTOKEN_DIR}/o200k_base.tiktoken" "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken" || true
-[ ! -f "\${TIKTOKEN_DIR}/cl100k_base.tiktoken" ] && wget -q -O "\${TIKTOKEN_DIR}/cl100k_base.tiktoken" "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken" || true
-
-# Pull image if needed
-docker pull "${TRT_IMAGE}" 2>/dev/null || true
-
-# Auto-detect worker's own network settings
-if command -v ibdev2netdev >/dev/null 2>&1; then
-  PRIMARY_IF=\$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print \$5}' | grep "^enp1" | head -1)
-  [ -z "\${PRIMARY_IF}" ] && PRIMARY_IF=\$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print \$5}' | head -1)
-  NCCL_SOCKET_IFNAME="\${PRIMARY_IF}"
-  GLOO_SOCKET_IFNAME="\${PRIMARY_IF}"
-  IB_DEVICES=\$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print \$1}' | sort | tr '\n' ',' | sed 's/,\$//')
-  NCCL_IB_HCA="\${IB_DEVICES}"
-fi
-
-# Clean up old container
-WORKER_NAME="trtllm-worker-\$(hostname -s)"
-docker rm -f "\${WORKER_NAME}" 2>/dev/null || true
-
-# Create API config on worker
-cat > /tmp/trtllm-api-config.yml << CONFIGEOF
-print_iter_log: false
-kv_cache_config:
-  dtype: "auto"
-  free_gpu_memory_fraction: ${GPU_MEMORY_FRACTION}
-cuda_graph_config:
-  enable_padding: true
-disable_overlap_scheduler: true
-CONFIGEOF
-
-# Build environment args
-ENV_ARGS="-e HF_TOKEN=\${HF_TOKEN:-} -e HF_HOME=/root/.cache/huggingface"
-ENV_ARGS="\${ENV_ARGS} -e TIKTOKEN_ENCODINGS_BASE=/tiktoken_encodings"
-ENV_ARGS="\${ENV_ARGS} -e NCCL_DEBUG=\${NCCL_DEBUG} -e NCCL_IB_DISABLE=\${NCCL_IB_DISABLE}"
-ENV_ARGS="\${ENV_ARGS} -e NCCL_NET_GDR_LEVEL=\${NCCL_NET_GDR_LEVEL} -e NCCL_TIMEOUT=\${NCCL_TIMEOUT}"
-[ -n "\${NCCL_SOCKET_IFNAME:-}" ] && ENV_ARGS="\${ENV_ARGS} -e NCCL_SOCKET_IFNAME=\${NCCL_SOCKET_IFNAME}"
-[ -n "\${GLOO_SOCKET_IFNAME:-}" ] && ENV_ARGS="\${ENV_ARGS} -e GLOO_SOCKET_IFNAME=\${GLOO_SOCKET_IFNAME}"
-[ -n "\${NCCL_IB_HCA:-}" ] && ENV_ARGS="\${ENV_ARGS} -e NCCL_IB_HCA=\${NCCL_IB_HCA}"
-
-# Build TensorRT-LLM command
-TRT_ARGS="--tp_size \${TENSOR_PARALLEL} --backend \${TRT_BACKEND}"
-TRT_ARGS="\${TRT_ARGS} --max_num_tokens \${MAX_NUM_TOKENS} --max_batch_size \${MAX_BATCH_SIZE}"
-TRT_ARGS="\${TRT_ARGS} --port \${TRT_PORT}"
-[ "\${TRUST_REMOTE_CODE}" = "true" ] && TRT_ARGS="\${TRT_ARGS} --trust_remote_code"
-[ -n "\${EXTRA_ARGS}" ] && TRT_ARGS="\${TRT_ARGS} \${EXTRA_ARGS}"
-
-# Check for InfiniBand device
-DEVICE_ARGS=""
-[ -d "/dev/infiniband" ] && DEVICE_ARGS="--device=/dev/infiniband"
-
-# Start container with MPI rank for multi-node
-docker run -d \
-  --restart no \
-  --name "\${WORKER_NAME}" \
-  --gpus all \
-  --network host \
-  --shm-size="\${SHM_SIZE}" \
-  --ulimit memlock=-1 \
-  --ulimit stack=67108864 \
-  --ipc=host \
-  \${DEVICE_ARGS} \
-  -v "\${HF_CACHE}:/root/.cache/huggingface" \
-  -v "\${TIKTOKEN_DIR}:/tiktoken_encodings" \
-  -v "/tmp/trtllm-api-config.yml:/tmp/extra-llm-api-config.yml:ro" \
-  \${ENV_ARGS} \
-  "\${TRT_IMAGE}" \
-  sleep infinity
-
-echo "Worker \${WORKER_NAME} started on \$(hostname)"
-WORKER_EOF
-
-    NODE_RANK=$((NODE_RANK + 1))
-  done
-
-  # Wait briefly for workers to start
-  log "  Waiting for workers to initialize..."
-  sleep 5
-else
-  log "Step 5: Skipping workers (head-only mode or single node)"
-fi
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Step 6: Start head node container
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-log "Step 6: Starting head node container"
-
-# Build environment variable arguments
-ENV_ARGS=(
-  -e "HF_TOKEN=${HF_TOKEN:-}"
-  -e "HF_HOME=/root/.cache/huggingface"
-  -e "TIKTOKEN_ENCODINGS_BASE=/tiktoken_encodings"
-  -e "NCCL_DEBUG=${NCCL_DEBUG}"
-  -e "NCCL_IB_DISABLE=${NCCL_IB_DISABLE}"
-  -e "NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL}"
-  -e "NCCL_TIMEOUT=${NCCL_TIMEOUT}"
-)
-
-[ -n "${NCCL_SOCKET_IFNAME:-}" ] && ENV_ARGS+=(-e "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}")
-[ -n "${GLOO_SOCKET_IFNAME:-}" ] && ENV_ARGS+=(-e "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME}")
-[ -n "${NCCL_IB_HCA:-}" ] && ENV_ARGS+=(-e "NCCL_IB_HCA=${NCCL_IB_HCA}")
-
-# Volume mounts
-VOLUME_ARGS=(
-  -v "${HF_CACHE}:/root/.cache/huggingface"
-  -v "${TIKTOKEN_DIR}:/tiktoken_encodings"
-  -v "${TRT_CONFIG_FILE}:/tmp/extra-llm-api-config.yml:ro"
-)
-
-# Device args
-DEVICE_ARGS=()
-[ -d "/dev/infiniband" ] && DEVICE_ARGS+=(--device=/dev/infiniband)
-
-# Start container in detached mode with sleep infinity
-docker run -d \
-  --restart no \
-  --name "${HEAD_CONTAINER_NAME}" \
-  --gpus all \
-  --network host \
-  --shm-size="${SHM_SIZE}" \
-  --ulimit memlock=-1 \
-  --ulimit stack=67108864 \
-  --ipc=host \
-  "${DEVICE_ARGS[@]}" \
-  "${VOLUME_ARGS[@]}" \
-  "${ENV_ARGS[@]}" \
-  "${TRT_IMAGE}" \
-  sleep infinity
-
-if ! docker ps | grep -q "${HEAD_CONTAINER_NAME}"; then
-  error "Head container failed to start. Check: docker logs ${HEAD_CONTAINER_NAME}"
-fi
-
-log "  Head container started"
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Step 7: Build TensorRT-LLM serve command and start server
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-log "Step 7: Starting TensorRT-LLM server"
-
-# Build command arguments
-TRT_CMD_ARGS="--tp_size ${TENSOR_PARALLEL}"
-TRT_CMD_ARGS="${TRT_CMD_ARGS} --backend ${TRT_BACKEND}"
-TRT_CMD_ARGS="${TRT_CMD_ARGS} --max_num_tokens ${MAX_NUM_TOKENS}"
-TRT_CMD_ARGS="${TRT_CMD_ARGS} --max_batch_size ${MAX_BATCH_SIZE}"
-TRT_CMD_ARGS="${TRT_CMD_ARGS} --port ${TRT_PORT}"
-
-if [ "${TRUST_REMOTE_CODE}" = "true" ]; then
-  TRT_CMD_ARGS="${TRT_CMD_ARGS} --trust_remote_code"
-fi
-
-if [ -n "${EXTRA_ARGS}" ]; then
-  TRT_CMD_ARGS="${TRT_CMD_ARGS} ${EXTRA_ARGS}"
-fi
-
-# For multi-node, use MPI
 if [ "${NUM_NODES}" -gt 1 ]; then
-  # Create MPI hostfile (uses InfiniBand IPs for NCCL communication)
-  HOSTFILE_CONTENT="${HEAD_IP} slots=1"
-  for WORKER_IB in "${WORKER_IB_IP_ARRAY[@]}"; do
-    HOSTFILE_CONTENT="${HOSTFILE_CONTENT}\n${WORKER_IB} slots=1"
+  log "Step 4b: Setting up SSH keys for MPI"
+  SSH_DIR="/tmp/trtllm-ssh"
+  rm -rf "${SSH_DIR}"
+  mkdir -p "${SSH_DIR}"
+
+  # Generate new key pair for container SSH
+  ssh-keygen -t rsa -b 4096 -f "${SSH_DIR}/id_rsa" -N "" -q
+  cp "${SSH_DIR}/id_rsa.pub" "${SSH_DIR}/authorized_keys"
+
+  # Copy to all workers
+  for SSH_HOST in "${WORKER_HOST_ARRAY[@]}"; do
+    ssh "${WORKER_USER}@${SSH_HOST}" "rm -rf ${SSH_DIR}; mkdir -p ${SSH_DIR}"
+    scp -q "${SSH_DIR}"/* "${WORKER_USER}@${SSH_HOST}:${SSH_DIR}/"
   done
-
-  docker exec "${HEAD_CONTAINER_NAME}" bash -c "echo -e '${HOSTFILE_CONTENT}' > /etc/openmpi-hostfile"
-
-  log "  Starting multi-node TensorRT-LLM server with MPI..."
-  docker exec -d "${HEAD_CONTAINER_NAME}" bash -c "
-    mpirun --allow-run-as-root -x HF_TOKEN -x NCCL_DEBUG -x NCCL_IB_DISABLE -x NCCL_NET_GDR_LEVEL \
-      --hostfile /etc/openmpi-hostfile \
-      trtllm-llmapi-launch trtllm-serve '${MODEL}' ${TRT_CMD_ARGS} \
-      > /var/log/trtllm.log 2>&1
-  "
-else
-  log "  Starting single-node TensorRT-LLM server..."
-  docker exec -d "${HEAD_CONTAINER_NAME}" bash -c "
-    trtllm-serve '${MODEL}' ${TRT_CMD_ARGS} > /var/log/trtllm.log 2>&1
-  "
+  log "  SSH keys distributed to all nodes"
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Step 8: Wait for cluster to be ready
+# Step 5: Remove existing stack/containers
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 8: Waiting for cluster to be ready"
+log "Step 5: Cleaning up existing deployment"
+docker stack rm "${STACK_NAME}" 2>/dev/null || true
+docker rm -f trtllm-head 2>/dev/null || true
+
+# Wait for stack removal to complete (network removal is async)
+for i in $(seq 1 30); do
+  if ! docker network ls --format '{{.Name}}' | grep -q "^${STACK_NAME}"; then
+    break
+  fi
+  sleep 1
+done
+sleep 2
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 6: Deploy based on mode (single-node or multi-node)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if [ "${NUM_NODES}" -gt 1 ]; then
+  # =========================================================================
+  # Multi-node deployment using Docker Stack (NVIDIA recommended approach)
+  # =========================================================================
+
+  log "Step 6: Deploying multi-node stack"
+
+  # Export variables for docker-compose.yml
+  export TRT_IMAGE HF_TOKEN HF_CACHE TIKTOKEN_DIR
+  export NCCL_DEBUG NCCL_IB_DISABLE NCCL_NET_GDR_LEVEL NCCL_TIMEOUT
+  export NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME NCCL_IB_HCA
+
+  # Deploy the stack
+  docker stack deploy --detach=true -c "${SCRIPT_DIR}/docker-compose.yml" "${STACK_NAME}"
+
+  # Wait for containers to start
+  log "  Waiting for stack containers to start..."
+  for i in $(seq 1 60); do
+    RUNNING=$(docker stack ps "${STACK_NAME}" --filter "desired-state=running" --format "{{.ID}}" 2>/dev/null | wc -l)
+    if [ "${RUNNING}" -ge "${NUM_NODES}" ]; then
+      log "  All ${NUM_NODES} containers running"
+      break
+    fi
+    sleep 2
+  done
+
+  # Get container ID (on this node)
+  sleep 5
+  CONTAINER_ID=$(docker ps -q -f name="${STACK_NAME}")
+  if [ -z "${CONTAINER_ID}" ]; then
+    error "Could not find running container for stack ${STACK_NAME}"
+  fi
+  log "  Container: ${CONTAINER_ID}"
+
+  # Generate MPI hostfile from container hostnames in overlay network
+  log "Step 7: Creating MPI hostfile"
+  # Get hostnames of all containers in the stack (via overlay network)
+  # In Docker Swarm, containers can reach each other via service DNS or hostname
+  docker stack ps "${STACK_NAME}" --filter "desired-state=running" \
+    --format '{{.Node}}' > /tmp/openmpi-hostfile
+
+  # Copy hostfile to container first
+  docker cp /tmp/openmpi-hostfile "${CONTAINER_ID}":/etc/openmpi-hostfile
+
+  # Wait for SSH to be ready on ALL hosts in the hostfile
+  log "  Waiting for SSH to be ready on all containers..."
+  MAX_SSH_WAIT=120
+  for host in $(cat /tmp/openmpi-hostfile); do
+    log "    Checking SSH on ${host}..."
+    for i in $(seq 1 ${MAX_SSH_WAIT}); do
+      if docker exec "${CONTAINER_ID}" ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no -o BatchMode=yes "${host}" hostname >/dev/null 2>&1; then
+        log "    SSH ready on ${host} (${i}s)"
+        break
+      fi
+      if [ $((i % 10)) -eq 0 ]; then
+        log "      Still waiting for SSH on ${host}... (${i}s)"
+      fi
+      sleep 1
+    done
+    if [ "${i}" -ge "${MAX_SSH_WAIT}" ]; then
+      log "  WARNING: SSH not ready on ${host} after ${MAX_SSH_WAIT}s"
+    fi
+  done
+  log "  Hostfile created with $(wc -l < /tmp/openmpi-hostfile) nodes:"
+  cat /tmp/openmpi-hostfile
+
+  # Download model (if not cached) - only on head node since cache is shared
+  if [ "${SKIP_DOWNLOAD}" != "true" ]; then
+    log "Step 8: Downloading model (head node only, shared cache)"
+    docker exec \
+      -e MODEL="${MODEL}" \
+      -e HF_TOKEN="${HF_TOKEN:-}" \
+      "${CONTAINER_ID}" bash -c 'huggingface-cli download "${MODEL}"' || true
+  else
+    log "Step 8: Skipping model download (--skip-download)"
+  fi
+
+  # Build serve command
+  TRT_ARGS="--tp_size ${TENSOR_PARALLEL} --backend ${TRT_BACKEND}"
+  TRT_ARGS="${TRT_ARGS} --max_num_tokens ${MAX_NUM_TOKENS} --max_batch_size ${MAX_BATCH_SIZE}"
+  TRT_ARGS="${TRT_ARGS} --extra_llm_api_options /tmp/extra-llm-api-config.yml"
+  TRT_ARGS="${TRT_ARGS} --port ${TRT_PORT}"
+  [ "${TRUST_REMOTE_CODE}" = "true" ] && TRT_ARGS="${TRT_ARGS} --trust_remote_code"
+  [ -n "${EXTRA_ARGS}" ] && TRT_ARGS="${TRT_ARGS} ${EXTRA_ARGS}"
+
+  # Start TensorRT-LLM server
+  log "Step 9: Starting TensorRT-LLM server via MPI"
+  docker exec -d \
+    -e MODEL="${MODEL}" \
+    -e HF_TOKEN="${HF_TOKEN:-}" \
+    -e TENSOR_PARALLEL="${TENSOR_PARALLEL}" \
+    "${CONTAINER_ID}" bash -c "
+      mpirun --allow-run-as-root -np ${TENSOR_PARALLEL} \
+        --hostfile /etc/openmpi-hostfile \
+        -x HF_TOKEN \
+        trtllm-llmapi-launch trtllm-serve '${MODEL}' ${TRT_ARGS} \
+        > /var/log/trtllm.log 2>&1
+    "
+
+else
+  # =========================================================================
+  # Single-node deployment (simple docker run)
+  # =========================================================================
+
+  log "Step 6: Starting single-node TensorRT-LLM server"
+
+  TRT_ARGS="--tp_size 1 --backend ${TRT_BACKEND}"
+  TRT_ARGS="${TRT_ARGS} --max_num_tokens ${MAX_NUM_TOKENS} --max_batch_size ${MAX_BATCH_SIZE}"
+  TRT_ARGS="${TRT_ARGS} --port ${TRT_PORT}"
+  [ "${TRUST_REMOTE_CODE}" = "true" ] && TRT_ARGS="${TRT_ARGS} --trust_remote_code"
+
+  docker run -d \
+    --name trtllm-head \
+    --gpus all \
+    --network host \
+    --shm-size=32g \
+    --ulimit memlock=-1 \
+    --ulimit stack=67108864 \
+    --ipc=host \
+    -v "${HF_CACHE}:/root/.cache/huggingface" \
+    -v "${TIKTOKEN_DIR}:/tiktoken_encodings:ro" \
+    -v "${TRT_CONFIG_FILE}:/tmp/extra-llm-api-config.yml:ro" \
+    -e "HF_TOKEN=${HF_TOKEN:-}" \
+    -e "HF_HOME=/root/.cache/huggingface" \
+    -e "TIKTOKEN_ENCODINGS_BASE=/tiktoken_encodings" \
+    "${TRT_IMAGE}" \
+    trtllm-serve "${MODEL}" ${TRT_ARGS}
+
+  CONTAINER_ID="trtllm-head"
+fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Wait for cluster to be ready
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+log "Step 10: Waiting for cluster to be ready"
 
 if [ "${NUM_NODES}" -gt 1 ]; then
   MAX_WAIT=600
@@ -551,8 +449,6 @@ else
 fi
 
 READY=false
-CONSECUTIVE_FAILURES=0
-MAX_CONSECUTIVE_FAILURES=10
 
 for i in $(seq 1 ${MAX_WAIT}); do
   if curl -sf "http://127.0.0.1:${TRT_PORT}/health" >/dev/null 2>&1; then
@@ -561,74 +457,57 @@ for i in $(seq 1 ${MAX_WAIT}); do
     break
   fi
 
-  # Check if head container is still running
-  CONTAINER_STATUS=$(docker inspect -f '{{.State.Status}}' "${HEAD_CONTAINER_NAME}" 2>/dev/null || echo "not_found")
-
-  if [ "${CONTAINER_STATUS}" = "exited" ] || [ "${CONTAINER_STATUS}" = "dead" ]; then
-    EXIT_CODE=$(docker inspect -f '{{.State.ExitCode}}' "${HEAD_CONTAINER_NAME}" 2>/dev/null || echo "unknown")
-    if [ "${EXIT_CODE}" != "0" ]; then
-      error "Head container exited with code ${EXIT_CODE}. Check: docker logs ${HEAD_CONTAINER_NAME}"
-    fi
-    CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
-  elif [ "${CONTAINER_STATUS}" = "not_found" ]; then
-    CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
-  else
-    CONSECUTIVE_FAILURES=0
-  fi
-
-  if [ ${CONSECUTIVE_FAILURES} -ge ${MAX_CONSECUTIVE_FAILURES} ]; then
-    error "Head container not running after ${MAX_CONSECUTIVE_FAILURES} checks. Check: docker logs ${HEAD_CONTAINER_NAME}"
-  fi
-
-  # Progress every 30 seconds
   if [ $((i % 30)) -eq 0 ]; then
     log "  Still initializing... (${i}s)"
-    docker exec "${HEAD_CONTAINER_NAME}" tail -2 /var/log/trtllm.log 2>&1 | grep -v "^$" | head -1 || true
+    # Show recent log output
+    if [ "${NUM_NODES}" -gt 1 ]; then
+      docker exec "${CONTAINER_ID}" tail -3 /var/log/trtllm.log 2>/dev/null | grep -v "^$" || true
+    else
+      docker logs --tail 3 "${CONTAINER_ID}" 2>&1 | grep -v "^$" || true
+    fi
   fi
 
   sleep 1
 done
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Output Summary
+# Summary
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# Detect public-facing IP
-PUBLIC_IP=$(ip -o addr show | grep "inet " | grep -v "127.0.0.1" | grep -v "169.254" | grep -v "172.17" | awk '{print $4}' | cut -d'/' -f1 | head -1)
-[ -z "${PUBLIC_IP}" ] && PUBLIC_IP="${HEAD_IP}"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
 if [ "${READY}" = "true" ]; then
-  echo " TensorRT-LLM Cluster is READY!"
+  echo " TensorRT-LLM cluster is READY!"
+  echo ""
+  echo " Model:    ${MODEL}"
+  echo " API:      http://127.0.0.1:${TRT_PORT}"
+  echo " Nodes:    ${NUM_NODES}"
+  echo ""
+  echo " Test:"
+  echo "   curl http://127.0.0.1:${TRT_PORT}/v1/models"
+  echo ""
+  echo " Chat:"
+  echo "   curl -s http://localhost:${TRT_PORT}/v1/chat/completions \\"
+  echo "     -H 'Content-Type: application/json' \\"
+  echo "     -d '{\"model\": \"${MODEL}\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello!\"}]}'"
+  echo ""
+  echo " Logs:"
+  if [ "${NUM_NODES}" -gt 1 ]; then
+    echo "   docker exec ${CONTAINER_ID} tail -f /var/log/trtllm.log"
+  else
+    echo "   docker logs -f ${CONTAINER_ID}"
+  fi
 else
-  echo " TensorRT-LLM Cluster Started (still initializing)"
+  echo " TensorRT-LLM cluster startup TIMED OUT"
+  echo ""
+  echo " Check logs:"
+  if [ "${NUM_NODES}" -gt 1 ]; then
+    echo "   docker exec ${CONTAINER_ID} cat /var/log/trtllm.log"
+    echo "   docker stack ps ${STACK_NAME}"
+  else
+    echo "   docker logs ${CONTAINER_ID}"
+  fi
 fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
-echo "Cluster Info:"
-echo "  Nodes:         ${NUM_NODES} (1 head + $((NUM_NODES - 1)) workers)"
-echo "  Model:         ${MODEL}"
-echo "  TP:            ${TENSOR_PARALLEL}"
-echo "  Backend:       ${TRT_BACKEND}"
-echo ""
-echo "API Endpoints:"
-echo "  API:           http://${PUBLIC_IP}:${TRT_PORT}/v1"
-echo "  Health:        http://${PUBLIC_IP}:${TRT_PORT}/health"
-echo ""
-echo "Quick Test:"
-echo "  curl http://${PUBLIC_IP}:${TRT_PORT}/v1/chat/completions \\"
-echo "    -H 'Content-Type: application/json' \\"
-echo "    -d '{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
-echo ""
-echo "Logs:"
-echo "  docker exec ${HEAD_CONTAINER_NAME} tail -f /var/log/trtllm.log"
-for i in "${!WORKER_IB_IP_ARRAY[@]}"; do
-  SSH_HOST="${WORKER_HOST_ARRAY[$i]:-${WORKER_IB_IP_ARRAY[$i]}}"
-  echo "  ssh ${WORKER_USER}@${SSH_HOST} docker logs -f trtllm-worker-*"
-done
-echo ""
-echo "Stop Cluster:"
-echo "  ./stop_cluster.sh"
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

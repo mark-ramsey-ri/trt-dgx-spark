@@ -1,0 +1,59 @@
+version: "3.8"
+
+services:
+  trtllm:
+    image: ${TRT_IMAGE:-nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc4}
+    hostname: "{{.Node.Hostname}}"
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HF_HOME=/root/.cache/huggingface
+      - TIKTOKEN_ENCODINGS_BASE=/tiktoken_encodings
+      - NCCL_DEBUG=${NCCL_DEBUG:-INFO}
+      - NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}
+      - NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-5}
+      - NCCL_TIMEOUT=${NCCL_TIMEOUT:-1200}
+      - NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-}
+      - GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-}
+      - NCCL_IB_HCA=${NCCL_IB_HCA:-}
+      # UCX: Disable shared memory transport (doesn't work in Docker Swarm)
+      - UCX_TLS=tcp,cuda_copy,cuda_ipc
+      - UCX_NET_DEVICES=all
+    volumes:
+      - ${HF_CACHE:-/raid/hf-cache}:/root/.cache/huggingface
+      - ${TIKTOKEN_DIR:-/home/rispark/tiktoken_encodings}:/tiktoken_encodings:ro
+      - /tmp/trtllm-api-config.yml:/tmp/extra-llm-api-config.yml:ro
+      - /tmp/trtllm-ssh:/tmp/ssh-stage:ro
+    networks:
+      - trtllm-net
+    deploy:
+      mode: global
+      resources:
+        reservations:
+          generic_resources:
+            - discrete_resource_spec:
+                kind: "NVIDIA_GPU"
+                value: 1
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    stdin_open: true
+    tty: true
+    # Start SSHD and then sleep
+    command: >
+      bash -c "
+        apt-get update && apt-get install -y openssh-server >/dev/null 2>&1 || true;
+        mkdir -p /root/.ssh /var/run/sshd;
+        cp /tmp/ssh-stage/* /root/.ssh/ 2>/dev/null || true;
+        chmod 700 /root/.ssh;
+        chmod 600 /root/.ssh/id_rsa 2>/dev/null || true;
+        chmod 644 /root/.ssh/id_rsa.pub /root/.ssh/authorized_keys 2>/dev/null || true;
+        echo 'StrictHostKeyChecking no' >> /root/.ssh/config;
+        echo 'UserKnownHostsFile /dev/null' >> /root/.ssh/config;
+        /usr/sbin/sshd;
+        sleep infinity
+      "
+
+networks:
+  trtllm-net:
+    driver: overlay
+    attachable: true
