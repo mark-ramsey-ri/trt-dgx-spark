@@ -11,22 +11,38 @@ services:
       - NCCL_DEBUG=${NCCL_DEBUG:-INFO}
       - NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}
       - NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-5}
-      - NCCL_TIMEOUT=${NCCL_TIMEOUT:-1200}
+      - NCCL_TIMEOUT=${NCCL_TIMEOUT:-1200000}
       - NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-}
       - GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-}
       - NCCL_IB_HCA=${NCCL_IB_HCA:-}
       # UCX: Disable shared memory transport (doesn't work in Docker Swarm)
+      # Force UCX to use eth0 (overlay network) only
       - UCX_TLS=tcp,cuda_copy,cuda_ipc
-      - UCX_NET_DEVICES=all
+      - UCX_NET_DEVICES=eth0
+      - OMPI_MCA_btl_tcp_if_include=eth0
+      - OMPI_MCA_oob_tcp_if_include=eth0
+      # Fix Triton CUDA compilation on ARM64 (DGX Spark)
+      - CPATH=/usr/local/cuda/include
+      - C_INCLUDE_PATH=/usr/local/cuda/include
+      - CPLUS_INCLUDE_PATH=/usr/local/cuda/include
+      - LIBRARY_PATH=/usr/local/cuda/lib64
     volumes:
       - ${HF_CACHE:-/raid/hf-cache}:/root/.cache/huggingface
       - ${TIKTOKEN_DIR:-/home/rispark/tiktoken_encodings}:/tiktoken_encodings:ro
       - /tmp/trtllm-api-config.yml:/tmp/extra-llm-api-config.yml:ro
       - /tmp/trtllm-ssh:/tmp/ssh-stage:ro
+      # Mount host's /dev/shm for larger shared memory (shm_size not supported in Swarm)
+      - /dev/shm:/dev/shm
     networks:
       - trtllm-net
+    ports:
+      - target: ${TRT_PORT:-8355}
+        published: ${TRT_PORT:-8355}
+        protocol: tcp
+        mode: host
     deploy:
       mode: global
+      endpoint_mode: dnsrr
       resources:
         reservations:
           generic_resources:
@@ -41,7 +57,20 @@ services:
     # Start SSHD and then sleep
     command: >
       bash -c "
-        apt-get update && apt-get install -y openssh-server >/dev/null 2>&1 || true;
+        echo 'Installing openssh-server...';
+        for attempt in 1 2 3; do
+          apt-get update -o Acquire::CompressionTypes::Order::=gz 2>&1 | tail -5 || true;
+          if apt-get install -y --no-install-recommends openssh-server 2>&1; then
+            echo 'openssh-server installed successfully';
+            break;
+          fi;
+          echo \"Attempt $$attempt failed, retrying in 5s...\";
+          sleep 5;
+        done;
+        if [ ! -x /usr/sbin/sshd ]; then
+          echo 'ERROR: Failed to install openssh-server after 3 attempts';
+          exit 1;
+        fi;
         mkdir -p /root/.ssh /var/run/sshd;
         cp /tmp/ssh-stage/* /root/.ssh/ 2>/dev/null || true;
         chmod 700 /root/.ssh;
@@ -50,6 +79,7 @@ services:
         echo 'StrictHostKeyChecking no' >> /root/.ssh/config;
         echo 'UserKnownHostsFile /dev/null' >> /root/.ssh/config;
         /usr/sbin/sshd;
+        echo 'SSHD started, ready for MPI';
         sleep infinity
       "
 

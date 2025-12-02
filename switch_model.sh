@@ -24,9 +24,8 @@ HF_TOKEN="${HF_TOKEN:-}"
 # Model Definitions
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Model HuggingFace IDs (optimized for TensorRT-LLM)
+# Model HuggingFace IDs (matching vLLM/SGLang configuration)
 MODELS=(
-  "nvidia/Qwen3-235B-A22B-FP4"
   "openai/gpt-oss-120b"
   "openai/gpt-oss-20b"
   "Qwen/Qwen2.5-7B-Instruct"
@@ -38,34 +37,30 @@ MODELS=(
   "mistralai/Mixtral-8x7B-Instruct-v0.1"
   "meta-llama/Llama-3.1-8B-Instruct"
   "meta-llama/Llama-3.1-70B-Instruct"
-  "meta-llama/Llama-3.3-70B-Instruct"
   "microsoft/phi-4"
   "google/gemma-2-27b-it"
 )
 
 # Human-readable model descriptions
 MODEL_NAMES=(
-  "Qwen3-235B-FP4 (235B params, FP4, TRT-LLM optimized)"
-  "GPT-OSS-120B (120B params, MoE, ~80GB+, high quality)"
-  "GPT-OSS-20B (21B params, MoE, ~16-20GB, fast)"
-  "Qwen2.5-7B (7B params, ~7GB, very fast)"
-  "Qwen2.5-14B (14B params, ~14GB, fast)"
-  "Qwen2.5-32B (32B params, ~30GB, strong mid-size)"
-  "Qwen2.5-72B (72B params, ~70GB, slow, high quality)"
-  "Mistral-7B v0.3 (7B params, ~7GB, very fast)"
-  "Mistral-Nemo-12B (12B params, ~12GB, 128k context)"
-  "Mixtral-8x7B (47B total, 12B active, ~45GB, MoE)"
-  "Llama-3.1-8B (8B params, ~8GB, very fast)"
-  "Llama-3.1-70B (70B params, ~65GB, high quality)"
-  "Llama-3.3-70B (70B params, ~65GB, latest)"
-  "Phi-4 (15B params, ~14-16GB, small but smart)"
-  "Gemma2-27B (27B params, ~24-28GB, strong mid-size)"
+  "GPT-OSS-120B (~80GB+, MoE reasoning model)"
+  "GPT-OSS-20B (~16-20GB, MoE, fast)"
+  "Qwen2.5-7B (~7GB, very fast)"
+  "Qwen2.5-14B (~14GB, fast)"
+  "Qwen2.5-32B (~30GB, strong mid-size)"
+  "Qwen2.5-72B (~70GB, high quality)"
+  "Mistral-7B v0.3 (~7GB, very fast)"
+  "Mistral-Nemo-12B (~12GB, 128k context)"
+  "Mixtral-8x7B (~45GB, MoE, fast)"
+  "Llama-3.1-8B (~8GB, very fast)"
+  "Llama-3.1-70B (~65GB, high quality)"
+  "Phi-4 (~14-16GB, small but smart)"
+  "Gemma2-27B (~24-28GB, strong mid-size)"
 )
 
 # Tensor Parallelism (number of GPUs needed)
-# All models use TP=2 to run across both DGX Spark nodes
+# Always use TP=2 to run across both DGX Spark nodes
 MODEL_TP=(
-  2    # Qwen3-235B-FP4
   2    # gpt-oss-120b
   2    # gpt-oss-20b
   2    # Qwen2.5-7B
@@ -77,14 +72,12 @@ MODEL_TP=(
   2    # Mixtral-8x7B
   2    # Llama-3.1-8B
   2    # Llama-3.1-70B
-  2    # Llama-3.3-70B
   2    # Phi-4
   2    # Gemma2-27B
 )
 
-# Number of nodes required
+# Number of nodes required (always 2 for DGX Spark cluster)
 MODEL_NODES=(
-  2    # Qwen3-235B-FP4
   2    # gpt-oss-120b
   2    # gpt-oss-20b
   2    # Qwen2.5-7B
@@ -96,14 +89,12 @@ MODEL_NODES=(
   2    # Mixtral-8x7B
   2    # Llama-3.1-8B
   2    # Llama-3.1-70B
-  2    # Llama-3.3-70B
   2    # Phi-4
   2    # Gemma2-27B
 )
 
 # GPU memory fraction (0.90 default, lower for larger models)
 MODEL_MEM=(
-  0.90  # Qwen3-235B-FP4
   0.90  # gpt-oss-120b
   0.90  # gpt-oss-20b
   0.90  # Qwen2.5-7B
@@ -115,14 +106,12 @@ MODEL_MEM=(
   0.85  # Mixtral-8x7B (MoE)
   0.90  # Llama-3.1-8B
   0.90  # Llama-3.1-70B
-  0.90  # Llama-3.3-70B
   0.90  # Phi-4
   0.90  # Gemma2-27B
 )
 
 # Maximum number of tokens (context window)
 MODEL_MAX_TOKENS=(
-  32768   # Qwen3-235B-FP4
   8192    # gpt-oss-120b
   8192    # gpt-oss-20b
   32768   # Qwen2.5-7B
@@ -134,14 +123,12 @@ MODEL_MAX_TOKENS=(
   32768   # Mixtral-8x7B
   131072  # Llama-3.1-8B (128k context)
   131072  # Llama-3.1-70B (128k context)
-  131072  # Llama-3.3-70B (128k context)
   16384   # Phi-4
   8192    # Gemma2-27B
 )
 
 # Maximum batch size
 MODEL_BATCH_SIZE=(
-  4     # Qwen3-235B-FP4
   4     # gpt-oss-120b
   8     # gpt-oss-20b
   16    # Qwen2.5-7B
@@ -153,14 +140,12 @@ MODEL_BATCH_SIZE=(
   8     # Mixtral-8x7B
   16    # Llama-3.1-8B
   4     # Llama-3.1-70B
-  4     # Llama-3.3-70B
   16    # Phi-4
   8     # Gemma2-27B
 )
 
 # Trust remote code flag
 MODEL_TRUST_REMOTE=(
-  true   # Qwen3-235B-FP4 - NVIDIA model
   false  # gpt-oss-120b
   false  # gpt-oss-20b
   false  # Qwen2.5-7B
@@ -172,14 +157,12 @@ MODEL_TRUST_REMOTE=(
   false  # Mixtral-8x7B
   false  # Llama-3.1-8B
   false  # Llama-3.1-70B
-  false  # Llama-3.3-70B
   true   # Phi-4 - requires trust_remote_code
   false  # Gemma2-27B
 )
 
 # Requires HF token (gated models)
 MODEL_NEEDS_TOKEN=(
-  false  # Qwen3-235B-FP4
   false  # gpt-oss-120b
   false  # gpt-oss-20b
   false  # Qwen2.5-7B
@@ -191,7 +174,6 @@ MODEL_NEEDS_TOKEN=(
   false  # Mixtral-8x7B
   true   # Llama-3.1-8B - gated
   true   # Llama-3.1-70B - gated
-  true   # Llama-3.3-70B - gated
   false  # Phi-4
   true   # Gemma2-27B - gated
 )

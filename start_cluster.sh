@@ -55,7 +55,7 @@ TIKTOKEN_DIR="${TIKTOKEN_DIR:-${HOME}/tiktoken_encodings}"
 NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-5}"
-NCCL_TIMEOUT="${NCCL_TIMEOUT:-1200}"
+NCCL_TIMEOUT="${NCCL_TIMEOUT:-1200000}"  # 20 minutes in ms (large models need time to init)
 
 # Worker configuration
 WORKER_HOST="${WORKER_HOST:-}"
@@ -80,8 +80,15 @@ if [ -z "${HEAD_IP:-}" ]; then
 fi
 
 # Auto-detect network interfaces
+# For Docker Swarm overlay networking, containers use eth0/eth1 instead of host interfaces
 if [ -z "${NCCL_SOCKET_IFNAME:-}" ]; then
-  if command -v ibdev2netdev >/dev/null 2>&1; then
+  if [ "${NUM_NODES:-1}" -gt 1 ]; then
+    # Multi-node: Use eth0 (overlay network interface inside containers)
+    # eth0 = overlay network (10.0.x.x), eth1 = docker_gwbridge (172.19.x.x, local only)
+    NCCL_SOCKET_IFNAME="eth0"
+    GLOO_SOCKET_IFNAME="eth0"
+  elif command -v ibdev2netdev >/dev/null 2>&1; then
+    # Single-node with host networking: detect host interface
     PRIMARY_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | grep "^enp1" | head -1)
     [ -z "${PRIMARY_IF}" ] && PRIMARY_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | head -1)
     NCCL_SOCKET_IFNAME="${PRIMARY_IF}"
@@ -337,12 +344,64 @@ if [ "${NUM_NODES}" -gt 1 ]; then
   fi
   log "  Container: ${CONTAINER_ID}"
 
-  # Generate MPI hostfile from container hostnames in overlay network
+  # Generate MPI hostfile from container IPs in overlay network
   log "Step 7: Creating MPI hostfile"
-  # Get hostnames of all containers in the stack (via overlay network)
-  # In Docker Swarm, containers can reach each other via service DNS or hostname
-  docker stack ps "${STACK_NAME}" --filter "desired-state=running" \
-    --format '{{.Node}}' > /tmp/openmpi-hostfile
+  # Docker Swarm DNS doesn't properly resolve node hostnames to specific containers,
+  # so we need to discover the actual overlay IPs from each node
+
+  NETWORK_NAME="${STACK_NAME}_trtllm-net"
+  > /tmp/openmpi-hostfile  # Clear the file
+
+  # Get list of nodes running this service
+  NODES=$(docker service ps "${STACK_NAME}_trtllm" --filter "desired-state=running" --format '{{.Node}}')
+
+  # Build hostfile with container IPs from each node
+  # Create a mapping of swarm node hostnames to their SSH IPs
+  declare -A NODE_TO_SSH_IP
+  NODE_TO_SSH_IP["$(hostname)"]="local"
+  for i in "${!WORKER_HOST_ARRAY[@]}"; do
+    # Get the swarm node name for this worker via SSH
+    WORKER_SSH="${WORKER_HOST_ARRAY[$i]}"
+    WORKER_NODE_NAME=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "${WORKER_USER}@${WORKER_SSH}" hostname 2>/dev/null || echo "")
+    if [ -n "${WORKER_NODE_NAME}" ]; then
+      NODE_TO_SSH_IP["${WORKER_NODE_NAME}"]="${WORKER_SSH}"
+    fi
+  done
+
+  for node in ${NODES}; do
+    if [ "${node}" = "$(hostname)" ]; then
+      # Local node - get container ID and inspect it directly for its overlay IP
+      LOCAL_CONTAINER=$(docker ps --filter "name=trtllm-multinode_trtllm" --format '{{.ID}}' | head -1)
+      LOCAL_IP=$(docker inspect "${LOCAL_CONTAINER}" \
+        --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
+      echo "${LOCAL_IP}" >> /tmp/openmpi-hostfile
+      log "    Local container (${node}): ${LOCAL_IP}"
+    else
+      # Remote node - SSH to get the container IP
+      WORKER_SSH_IP="${NODE_TO_SSH_IP[${node}]:-}"
+      if [ -z "${WORKER_SSH_IP}" ]; then
+        # Fallback: try the first worker IP
+        WORKER_SSH_IP="${WORKER_HOST_ARRAY[0]:-${WORKER_IB_IP_ARRAY[0]:-}}"
+      fi
+      if [ -n "${WORKER_SSH_IP}" ]; then
+        # Get container ID on remote node, then get its overlay network IP
+        REMOTE_IP=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "${WORKER_USER}@${WORKER_SSH_IP}" \
+          "CONTAINER=\$(docker ps --filter 'name=trtllm-multinode_trtllm' --format '{{.ID}}' | head -1); \
+           docker inspect \"\${CONTAINER}\" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'" 2>/dev/null)
+        if [ -n "${REMOTE_IP}" ]; then
+          echo "${REMOTE_IP}" >> /tmp/openmpi-hostfile
+          log "    Remote container (${node}): ${REMOTE_IP}"
+        else
+          log "  WARNING: Could not get IP for ${node}"
+        fi
+      else
+        log "  WARNING: No SSH IP mapping for node ${node}"
+      fi
+    fi
+  done
+
+  # Sort to ensure consistent ordering across nodes
+  sort -o /tmp/openmpi-hostfile /tmp/openmpi-hostfile
 
   # Copy hostfile to container first
   docker cp /tmp/openmpi-hostfile "${CONTAINER_ID}":/etc/openmpi-hostfile
@@ -372,10 +431,14 @@ if [ "${NUM_NODES}" -gt 1 ]; then
   # Download model (if not cached) - only on head node since cache is shared
   if [ "${SKIP_DOWNLOAD}" != "true" ]; then
     log "Step 8: Downloading model (head node only, shared cache)"
+    # Build HF token arg if provided
+    HF_TOKEN_ARG=""
+    if [ -n "${HF_TOKEN:-}" ]; then
+      HF_TOKEN_ARG="--token ${HF_TOKEN}"
+    fi
     docker exec \
-      -e MODEL="${MODEL}" \
-      -e HF_TOKEN="${HF_TOKEN:-}" \
-      "${CONTAINER_ID}" bash -c 'huggingface-cli download "${MODEL}"' || true
+      -e HF_HOME=/root/.cache/huggingface \
+      "${CONTAINER_ID}" bash -c "hf download ${MODEL} ${HF_TOKEN_ARG}" || true
   else
     log "Step 8: Skipping model download (--skip-download)"
   fi
@@ -384,12 +447,36 @@ if [ "${NUM_NODES}" -gt 1 ]; then
   TRT_ARGS="--tp_size ${TENSOR_PARALLEL} --backend ${TRT_BACKEND}"
   TRT_ARGS="${TRT_ARGS} --max_num_tokens ${MAX_NUM_TOKENS} --max_batch_size ${MAX_BATCH_SIZE}"
   TRT_ARGS="${TRT_ARGS} --extra_llm_api_options /tmp/extra-llm-api-config.yml"
-  TRT_ARGS="${TRT_ARGS} --port ${TRT_PORT}"
+  TRT_ARGS="${TRT_ARGS} --host 0.0.0.0 --port ${TRT_PORT}"
   [ "${TRUST_REMOTE_CODE}" = "true" ] && TRT_ARGS="${TRT_ARGS} --trust_remote_code"
   [ -n "${EXTRA_ARGS}" ] && TRT_ARGS="${TRT_ARGS} ${EXTRA_ARGS}"
 
   # Start TensorRT-LLM server
   log "Step 9: Starting TensorRT-LLM server via MPI"
+
+  # Create wrapper script that sets up environment for MPI remote processes
+  docker exec "${CONTAINER_ID}" bash -c 'cat > /tmp/mpi-wrapper.sh << '\''WRAPPER'\''
+#!/bin/bash
+# Environment setup for MPI remote processes (Triton needs CUDA toolchain)
+export PATH=/usr/local/cuda/bin:/usr/local/cmake/bin:/usr/local/lib/python3.12/dist-packages/torch_tensorrt/bin:/usr/local/nvidia/bin:/usr/local/mpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin:/opt/amazon/efa/bin:/opt/tensorrt/bin
+export CUDA_HOME=/usr/local/cuda
+export CPATH=/usr/local/cuda/include
+export C_INCLUDE_PATH=/usr/local/cuda/include
+export CPLUS_INCLUDE_PATH=/usr/local/cuda/include
+export LIBRARY_PATH=/usr/local/cuda/lib64
+# Triton: Explicitly set CUDA tools paths
+export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+export TRITON_CUOBJDUMP_PATH=/usr/local/cuda/bin/cuobjdump
+export TRITON_NVDISASM_PATH=/usr/local/cuda/bin/nvdisasm
+# Full LD_LIBRARY_PATH from container (TensorRT, CUDA, PyTorch, etc.)
+export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu:/opt/nvidia/nvda_nixl/lib64:/usr/local/ucx/lib:/usr/local/tensorrt/lib:/usr/local/cuda/lib64:/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/lib/python3.12/dist-packages/torch_tensorrt/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+exec "$@"
+WRAPPER
+chmod +x /tmp/mpi-wrapper.sh'
+
+  # Copy wrapper to remote nodes
+  docker exec "${CONTAINER_ID}" bash -c 'for host in $(cat /etc/openmpi-hostfile); do scp -o StrictHostKeyChecking=no /tmp/mpi-wrapper.sh $host:/tmp/mpi-wrapper.sh 2>/dev/null || true; done'
+
   docker exec -d \
     -e MODEL="${MODEL}" \
     -e HF_TOKEN="${HF_TOKEN:-}" \
@@ -397,8 +484,9 @@ if [ "${NUM_NODES}" -gt 1 ]; then
     "${CONTAINER_ID}" bash -c "
       mpirun --allow-run-as-root -np ${TENSOR_PARALLEL} \
         --hostfile /etc/openmpi-hostfile \
+        --map-by ppr:1:node \
         -x HF_TOKEN \
-        trtllm-llmapi-launch trtllm-serve '${MODEL}' ${TRT_ARGS} \
+        /tmp/mpi-wrapper.sh trtllm-llmapi-launch trtllm-serve '${MODEL}' ${TRT_ARGS} \
         > /var/log/trtllm.log 2>&1
     "
 

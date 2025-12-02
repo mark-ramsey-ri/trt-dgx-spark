@@ -186,7 +186,7 @@ echo ""
 echo -e "${BLUE}--- Advanced Settings (press Enter for defaults) ---${NC}"
 echo ""
 
-prompt_input "TRT_IMAGE" "Docker image" "nvcr.io/nvidia/tensorrt-llm/release:1.0.0rc3"
+prompt_input "TRT_IMAGE" "Docker image" "nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc4"
 prompt_input "TRT_PORT" "API port" "8355"
 prompt_input "GPU_MEMORY_FRACTION" "GPU memory fraction for KV cache (0.0-1.0)" "0.90"
 echo ""
