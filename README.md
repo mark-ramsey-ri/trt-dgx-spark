@@ -127,17 +127,19 @@ cd trt-dgx-spark
 
 ### 2. Setup SSH (one-time)
 
-Ensure passwordless SSH from head to worker:
+Ensure passwordless SSH from head to worker using the **standard Ethernet IP**:
 ```bash
 # On head node, generate key if needed:
 ssh-keygen -t ed25519  # Press enter for defaults
 
-# Copy to worker (replace with your worker's InfiniBand IP):
-ssh-copy-id <username>@<worker-ib-ip>
+# Copy to worker (use standard Ethernet IP, e.g., 192.168.x.x):
+ssh-copy-id <username>@<worker-ethernet-ip>
 
 # Test connection:
-ssh <username>@<worker-ib-ip> "hostname"
+ssh <username>@<worker-ethernet-ip> "hostname"
 ```
+
+> **Note:** Use the standard Ethernet IP for SSH (WORKER_HOST), not the InfiniBand IP.
 
 ### 3. Configure Environment
 
@@ -152,7 +154,8 @@ cp config.env config.local.env
 vim config.local.env
 
 # Set at minimum:
-# WORKER_IPS="<worker-infiniband-ip>"
+# WORKER_HOST="<worker-ethernet-ip>"     # For SSH (e.g., 192.168.7.111)
+# WORKER_IB_IP="<worker-infiniband-ip>"  # For NCCL (e.g., 169.254.216.8)
 # WORKER_USER="<ssh-username>"
 ```
 
@@ -243,7 +246,8 @@ Key settings in `config.env` or `config.local.env`:
 # ┌─────────────────────────────────────────────────────────────────┐
 # │ Required for Multi-Node                                         │
 # └─────────────────────────────────────────────────────────────────┘
-WORKER_IPS="<worker-ib-ip>"        # Worker InfiniBand IP(s), space-separated
+WORKER_HOST="192.168.7.111"        # Worker Ethernet IP for SSH access
+WORKER_IB_IP="169.254.216.8"       # Worker InfiniBand IP for NCCL/RDMA
 WORKER_USER="<username>"           # SSH username for workers
 
 # ┌─────────────────────────────────────────────────────────────────┐
@@ -269,20 +273,34 @@ TRT_IMAGE="nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc4"  # Docker image
 TRT_PORT="8355"                    # API port
 ```
 
-### Finding Worker InfiniBand IP
+### Finding Worker IP Addresses
 
-On the **worker node**, run:
+On the **worker node**, find both IP addresses:
+
 ```bash
+# ┌─────────────────────────────────────────────────────────────────┐
+# │ 1. WORKER_HOST - Standard Ethernet IP (for SSH)                 │
+# └─────────────────────────────────────────────────────────────────┘
+# This is your regular network IP (e.g., 192.168.x.x or 10.x.x.x)
+hostname -I | awk '{print $1}'
+# Or check your network interface:
+ip addr show eth0 | grep "inet "    # Replace eth0 with your interface
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │ 2. WORKER_IB_IP - InfiniBand IP (for NCCL/RDMA)                 │
+# └─────────────────────────────────────────────────────────────────┘
 # Find InfiniBand interface name
 ibdev2netdev
-
 # Example output: mlx5_0 port 1 ==> enp1s0f1np1 (Up)
 
-# Get IP address for that interface
+# Get IP address for that interface (typically 169.254.x.x)
 ip addr show enp1s0f1np1 | grep "inet "
-
-# Example output: inet 169.254.x.x/16 ...
+# Example output: inet 169.254.216.8/16 ...
 ```
+
+**Summary:**
+- `WORKER_HOST` = Standard Ethernet IP (e.g., `192.168.7.111`) - used for SSH
+- `WORKER_IB_IP` = InfiniBand IP (e.g., `169.254.216.8`) - used for high-speed GPU communication
 
 ## Switching Models
 
@@ -581,7 +599,9 @@ ssh <worker-ip> "docker logs -f trtllm-worker"
 
 ### Optimization Tips
 
-1. **Use InfiniBand IPs** - Ensure WORKER_IPS uses the 169.254.x.x InfiniBand addresses
+1. **Configure both IPs correctly:**
+   - `WORKER_HOST` = Ethernet IP for SSH (e.g., 192.168.x.x)
+   - `WORKER_IB_IP` = InfiniBand IP for NCCL (e.g., 169.254.x.x)
 2. **Docker Swarm** - Must be setup for multi-node GPU scheduling
 3. **Memory Fraction** - Set to 0.90 for max KV cache, reduce if OOM
 4. **Pre-download Models** - Use `switch_model.sh -d` to avoid download delays

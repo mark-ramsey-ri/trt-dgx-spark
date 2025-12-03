@@ -7,7 +7,8 @@
 # Network configuration (IPs, interfaces, HCAs) is auto-detected by scripts.
 #
 # Required configuration:
-#   - WORKER_IPS: Worker node InfiniBand IPs (space-separated)
+#   - WORKER_HOST: Worker Ethernet IP (for SSH access)
+#   - WORKER_IB_IP: Worker InfiniBand IP (for NCCL communication)
 #   - HF_TOKEN: HuggingFace token (for gated models like Llama)
 #
 # Usage:
@@ -139,13 +140,20 @@ echo ""
 echo -e "${GREEN}--- Required Settings ---${NC}"
 echo ""
 
-# Worker IPs (required for multi-node)
-echo "Worker Node InfiniBand IP(s):"
-echo "  For 2-node cluster, enter the worker's InfiniBand IP"
-echo "  Find it on worker: ibdev2netdev && ip addr show <interface>"
+# Worker host for SSH
+echo "WORKER_HOST - Standard Ethernet IP (for SSH access):"
+echo "  This is the regular network IP you use to SSH to the worker"
+echo "  Find it on worker: hostname -I | awk '{print \$1}'"
+echo "  Example: 192.168.7.111"
+prompt_input "WORKER_HOST" "Enter worker Ethernet IP" ""
+echo ""
+
+# Worker InfiniBand IP for NCCL
+echo "WORKER_IB_IP - InfiniBand IP (for high-speed NCCL/GPU communication):"
+echo "  This is the 169.254.x.x IP on the InfiniBand interface for RDMA"
+echo "  Find it on worker: ibdev2netdev && ip addr show <ib-interface>"
 echo "  Example: 169.254.216.8"
-echo "  For multiple workers: 169.254.x.x 169.254.y.y"
-prompt_input "WORKER_IPS" "Enter worker InfiniBand IP(s)" ""
+prompt_input "WORKER_IB_IP" "Enter worker InfiniBand IP" ""
 echo ""
 
 # Worker SSH username
@@ -201,7 +209,8 @@ echo -e "${GREEN}=============================================================${
 echo ""
 echo "Environment variables set:"
 echo ""
-[ -n "${WORKER_IPS:-}" ] && echo "  WORKER_IPS=$WORKER_IPS"
+[ -n "${WORKER_HOST:-}" ] && echo "  WORKER_HOST=$WORKER_HOST"
+[ -n "${WORKER_IB_IP:-}" ] && echo "  WORKER_IB_IP=$WORKER_IB_IP"
 [ -n "${WORKER_USER:-}" ] && echo "  WORKER_USER=$WORKER_USER"
 [ -n "${HF_TOKEN:-}" ] && echo "  HF_TOKEN=(hidden)"
 [ -n "${MODEL:-}" ] && echo "  MODEL=$MODEL"
