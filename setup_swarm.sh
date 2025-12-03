@@ -231,30 +231,33 @@ fi
 
 log "Step 3: Setting up Docker Swarm"
 
+# Auto-detect HEAD_IP from InfiniBand interface (same logic as start_cluster.sh)
+# This ensures we use a routable IP, not a link-local 169.254.x.x address
+if [ -z "${HEAD_IP:-}" ]; then
+  if command -v ibdev2netdev >/dev/null 2>&1; then
+    PRIMARY_IB_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | grep "^enp1" | head -1)
+    [ -z "${PRIMARY_IB_IF}" ] && PRIMARY_IB_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | head -1)
+    [ -n "${PRIMARY_IB_IF}" ] && HEAD_IP=$(ip -o addr show "${PRIMARY_IB_IF}" 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | head -1)
+  fi
+  if [ -z "${HEAD_IP:-}" ]; then
+    # Fallback to first non-loopback IP
+    HEAD_IP=$(hostname -I | awk '{print $1}')
+  fi
+fi
+log "  Using HEAD_IP: ${HEAD_IP}"
+
 # Check if already in swarm mode
 if docker info 2>/dev/null | grep -q "Swarm: active"; then
   log "  Docker Swarm already active"
 else
   log "  Initializing Docker Swarm on head node..."
-  # Get the InfiniBand IP for swarm advertising (use first available)
-  HEAD_ADVERTISE_IP=$(ip -4 addr show | grep -oP '169\.254\.\d+\.\d+' | head -1)
-  if [ -z "${HEAD_ADVERTISE_IP}" ]; then
-    # Fallback to any non-loopback IP
-    HEAD_ADVERTISE_IP=$(hostname -I | awk '{print $1}')
-  fi
-  docker swarm init --advertise-addr "${HEAD_ADVERTISE_IP}" || true
+  docker swarm init --advertise-addr "${HEAD_IP}" || true
 fi
 
 # Get join token for workers
 JOIN_TOKEN=$(docker swarm join-token worker -q 2>/dev/null)
-HEAD_ADVERTISE_IP=$(docker info 2>/dev/null | grep -A1 "Node Address" | tail -1 | tr -d ' ')
-if [ -z "${HEAD_ADVERTISE_IP}" ]; then
-  HEAD_ADVERTISE_IP=$(docker swarm join-token worker 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+:\d+' | head -1 | cut -d: -f1)
-fi
-SWARM_PORT=$(docker swarm join-token worker 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+:\d+' | head -1 | cut -d: -f2)
-SWARM_PORT="${SWARM_PORT:-2377}"
 
-# Join workers to swarm
+# Join workers to swarm using HEAD_IP (the routable IP we detected/configured)
 if [ ${#WORKER_HOST_ARRAY[@]} -gt 0 ]; then
   for host in "${WORKER_HOST_ARRAY[@]}"; do
     log "  Joining worker ${host} to swarm..."
@@ -267,8 +270,8 @@ if [ ${#WORKER_HOST_ARRAY[@]} -gt 0 ]; then
     else
       # Leave any existing swarm first
       ssh "${WORKER_USER}@${host}" "docker swarm leave --force 2>/dev/null || true"
-      # Join the swarm
-      ssh "${WORKER_USER}@${host}" "docker swarm join --token ${JOIN_TOKEN} ${HEAD_ADVERTISE_IP}:${SWARM_PORT}"
+      # Join the swarm using HEAD_IP
+      ssh "${WORKER_USER}@${host}" "docker swarm join --token ${JOIN_TOKEN} ${HEAD_IP}:2377"
       log "    Worker joined swarm"
     fi
   done
