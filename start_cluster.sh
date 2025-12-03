@@ -237,6 +237,44 @@ fi
 log "  Swarm nodes:"
 docker node ls --format "  {{.Hostname}}: {{.Status}}" 2>/dev/null || true
 
+# Verify GPU resources are visible on all nodes (critical for multi-node)
+if [ "${NUM_NODES}" -gt 1 ]; then
+  log "  Checking GPU resources on swarm nodes..."
+  NODES_MISSING_GPU=""
+  for node in $(docker node ls --format '{{.Hostname}}'); do
+    GPU_RESOURCES=$(docker node inspect "${node}" --format '{{.Description.Resources.GenericResources}}' 2>/dev/null)
+    if [ "${GPU_RESOURCES}" = "[]" ] || [ -z "${GPU_RESOURCES}" ]; then
+      NODES_MISSING_GPU="${NODES_MISSING_GPU} ${node}"
+      log "    ${node}: NO GPU RESOURCES"
+    else
+      log "    ${node}: GPU OK"
+    fi
+  done
+
+  if [ -n "${NODES_MISSING_GPU}" ]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo " ERROR: GPU resources not visible on some nodes!"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo " Nodes missing GPU resources:${NODES_MISSING_GPU}"
+    echo ""
+    echo " This means Docker Swarm cannot schedule GPU workloads on these nodes."
+    echo ""
+    echo " To fix, run:"
+    echo "   ./setup_swarm.sh"
+    echo ""
+    echo " This will configure:"
+    echo "   - /etc/docker/daemon.json with GPU generic resources"
+    echo "   - /etc/nvidia-container-runtime/config.toml with swarm-resource"
+    echo ""
+    echo " Make sure WORKER_HOST is set in config.local.env first!"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    exit 1
+  fi
+fi
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Step 3: Pull Docker image
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

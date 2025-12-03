@@ -137,15 +137,18 @@ echo ""
 # Required Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-echo -e "${GREEN}--- Required Settings ---${NC}"
+echo -e "${GREEN}--- Required Settings (CRITICAL for multi-node) ---${NC}"
 echo ""
 
 # Worker host for SSH
-echo "WORKER_HOST - Standard Ethernet IP (for SSH access):"
-echo "  This is the regular network IP you use to SSH to the worker"
-echo "  Find it on worker: hostname -I | awk '{print \$1}'"
+echo -e "${RED}WORKER_HOST - Worker IP address for SSH access:${NC}"
+echo "  REQUIRED: This must be set for setup_swarm.sh to configure the worker!"
+echo "  This is the IP address you use to SSH to the worker node."
+echo ""
+echo "  Find it on the worker by running: hostname -I | awk '{print \$1}'"
+echo ""
 echo "  Example: 192.168.7.111"
-prompt_input "WORKER_HOST" "Enter worker Ethernet IP" ""
+prompt_input "WORKER_HOST" "Enter worker IP address" ""
 echo ""
 
 # Worker high-speed network IP for NCCL
@@ -227,9 +230,21 @@ echo "  - HEAD_IP (from InfiniBand interface)"
 echo "  - Network interfaces (NCCL_SOCKET_IFNAME, GLOO_SOCKET_IFNAME)"
 echo "  - InfiniBand HCAs (NCCL_IB_HCA)"
 echo ""
-echo -e "${GREEN}Next step:${NC}"
-echo "  ./start_cluster.sh"
+if [ -z "${WORKER_HOST:-}" ]; then
+  echo -e "${RED}WARNING: WORKER_HOST is not set!${NC}"
+  echo "  Multi-node setup will NOT work without WORKER_HOST."
+  echo "  Please set it before running setup_swarm.sh"
+  echo ""
+fi
+
+echo -e "${GREEN}Next steps:${NC}"
 echo ""
-echo "Or to save this configuration for future use:"
-echo "  Create config.local.env with these exports"
+echo "  1. Save configuration (recommended):"
+echo "     Add these settings to config.local.env"
+echo ""
+echo "  2. Run swarm setup (configures GPU for Docker Swarm):"
+echo "     ./setup_swarm.sh"
+echo ""
+echo "  3. Start the cluster:"
+echo "     ./start_cluster.sh"
 echo ""
