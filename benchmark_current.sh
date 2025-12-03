@@ -395,44 +395,55 @@ def main():
     total_tps = (result.total_input_tokens + result.total_output_tokens) / duration if duration > 0 else 0
     req_throughput = result.successful_requests / duration if duration > 0 else 0
 
-    # Print results
+    # Print results in unified format
     print()
-    print("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("  Results Summary")
-    print("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("  Benchmark Results")
+    print("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print()
-    print(f"  Requests:              {result.successful_requests}/{result.total_requests} successful")
-    print(f"  Duration:              {duration:.2f}s")
+    print("  Test Configuration:")
+    print(f"    Platform:           TensorRT-LLM")
+    print(f"    Model:              {args.model}")
+    print(f"    Num Prompts:        {args.num_prompts}")
+    print(f"    Concurrency:        {args.concurrency}")
+    print(f"    Dataset:            ShareGPT_V3")
     print()
-    print(f"  Output token throughput:  {output_tps:.2f} tokens/sec")
-    print(f"  Total Token throughput:   {total_tps:.2f} tokens/sec")
-    print(f"  Request throughput:       {req_throughput:.2f} req/sec")
+    print("  Throughput Metrics:")
+    print(f"    Duration:           {duration:.2f}s")
+    print(f"    Requests/sec:       {req_throughput:.2f}")
+    print(f"    Output tok/s:       {output_tps:.2f}")
+    print(f"    Total tok/s:        {total_tps:.2f}")
     print()
-    print(f"  Mean latency:          {mean_latency:.2f} ms")
-    print(f"  P50 latency:           {p50_latency:.2f} ms")
-    print(f"  P99 latency:           {p99_latency:.2f} ms")
-    print(f"  Mean TTFT:             {mean_ttft:.2f} ms")
+    print("  Latency Metrics:")
+    print(f"    Mean Latency:       {mean_latency:.2f} ms")
+    print(f"    P50 Latency:        {p50_latency:.2f} ms")
+    print(f"    P99 Latency:        {p99_latency:.2f} ms")
+    print(f"    Mean TTFT:          {mean_ttft:.2f} ms")
     print()
-    print(f"  Total input tokens:    {result.total_input_tokens}")
-    print(f"  Total output tokens:   {result.total_output_tokens}")
+    print("  Request Statistics:")
+    print(f"    Completed:          {result.successful_requests}/{result.total_requests}")
+    print(f"    Total Input Tokens: {result.total_input_tokens}")
+    print(f"    Total Output Tokens:{result.total_output_tokens}")
     print()
 
     # Save to JSON if requested
     if args.output:
         output_data = {
+            'platform': 'TensorRT-LLM',
             'model': args.model,
             'num_prompts': args.num_prompts,
             'concurrency': args.concurrency,
-            'duration_s': duration,
+            'dataset': 'ShareGPT_V3',
+            'duration_s': round(duration, 2),
             'successful_requests': result.successful_requests,
             'failed_requests': result.failed_requests,
-            'output_throughput_tps': output_tps,
-            'total_throughput_tps': total_tps,
-            'request_throughput_rps': req_throughput,
-            'mean_latency_ms': mean_latency,
-            'p50_latency_ms': p50_latency,
-            'p99_latency_ms': p99_latency,
-            'mean_ttft_ms': mean_ttft,
+            'output_throughput_tps': round(output_tps, 2),
+            'total_throughput_tps': round(total_tps, 2),
+            'request_throughput_rps': round(req_throughput, 2),
+            'mean_latency_ms': round(mean_latency, 2),
+            'p50_latency_ms': round(p50_latency, 2),
+            'p99_latency_ms': round(p99_latency, 2),
+            'mean_ttft_ms': round(mean_ttft, 2),
             'total_input_tokens': result.total_input_tokens,
             'total_output_tokens': result.total_output_tokens
         }
