@@ -1,0 +1,5 @@
+# Local configuration (user-specific settings)
+config.local.env
+
+# Diagnostic logs
+diagnostic_report_*.log
