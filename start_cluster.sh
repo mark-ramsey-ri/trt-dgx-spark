@@ -67,11 +67,17 @@ WORKER_USER="${WORKER_USER:-$(whoami)}"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # Auto-detect HEAD_IP from InfiniBand interface
+# Priority: 1) config value, 2) InfiniBand interface IP, 3) first routable IP
 if [ -z "${HEAD_IP:-}" ]; then
   if command -v ibdev2netdev >/dev/null 2>&1; then
+    # Try DGX Spark naming convention first (enp1*), then any InfiniBand interface
     PRIMARY_IB_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | grep "^enp1" | head -1)
     [ -z "${PRIMARY_IB_IF}" ] && PRIMARY_IB_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | head -1)
     [ -n "${PRIMARY_IB_IF}" ] && HEAD_IP=$(ip -o addr show "${PRIMARY_IB_IF}" 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | head -1)
+  fi
+  # Fallback to first routable IP if InfiniBand detection failed
+  if [ -z "${HEAD_IP:-}" ]; then
+    HEAD_IP=$(hostname -I | awk '{print $1}')
   fi
   if [ -z "${HEAD_IP:-}" ]; then
     echo "ERROR: Could not auto-detect HEAD_IP. Please set HEAD_IP in config.env"

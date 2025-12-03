@@ -148,12 +148,12 @@ echo "  Example: 192.168.7.111"
 prompt_input "WORKER_HOST" "Enter worker Ethernet IP" ""
 echo ""
 
-# Worker InfiniBand IP for NCCL
-echo "WORKER_IB_IP - InfiniBand IP (for high-speed NCCL/GPU communication):"
-echo "  This is the 169.254.x.x IP on the InfiniBand interface for RDMA"
+# Worker high-speed network IP for NCCL
+echo "WORKER_IB_IP - High-speed network IP (for NCCL/GPU communication):"
+echo "  This is the IP on the InfiniBand/high-speed interface for RDMA"
 echo "  Find it on worker: ibdev2netdev && ip addr show <ib-interface>"
-echo "  Example: 169.254.216.8"
-prompt_input "WORKER_IB_IP" "Enter worker InfiniBand IP" ""
+echo "  Note: May be link-local (169.254.x.x) or routable depending on config"
+prompt_input "WORKER_IB_IP" "Enter worker high-speed network IP" ""
 echo ""
 
 # Worker SSH username
