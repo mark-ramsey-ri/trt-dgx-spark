@@ -170,6 +170,24 @@ echo '  Docker restarted successfully'
   # Run with proper TTY allocation for sudo password prompt
   ssh -tt "${SSH_TARGET}" "bash -c '${REMOTE_SCRIPT}'"
 
+  # Verify configuration was applied
+  log "  Verifying configuration on remote node..."
+  if ssh "${SSH_TARGET}" "grep -q 'node-generic-resources' /etc/docker/daemon.json 2>/dev/null"; then
+    log "    Docker daemon.json: OK"
+  else
+    log "    WARNING: Docker daemon.json may not be configured correctly"
+  fi
+  if ssh "${SSH_TARGET}" "grep -q '^swarm-resource' /etc/nvidia-container-runtime/config.toml 2>/dev/null"; then
+    log "    NVIDIA swarm-resource: OK"
+  else
+    log "    WARNING: NVIDIA swarm-resource may not be enabled"
+  fi
+
+  # Force worker to leave swarm so it can rejoin with fresh GPU resources
+  # This is required because Docker was just restarted with new GPU config
+  log "  Removing worker from swarm (will rejoin in step 3 with GPU resources)..."
+  ssh "${SSH_TARGET}" "docker swarm leave --force 2>/dev/null || true"
+
   log "  Remote node configured successfully"
 }
 
