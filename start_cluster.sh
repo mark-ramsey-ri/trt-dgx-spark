@@ -334,6 +334,31 @@ if [ "${NUM_NODES}" -gt 1 ]; then
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 4c: Ensure required directories exist on all nodes
+# Docker Swarm requires bind mount paths to exist before container creation
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if [ "${NUM_NODES}" -gt 1 ]; then
+  log "Step 4c: Ensuring required directories exist on worker nodes"
+
+  for SSH_HOST in "${WORKER_HOST_ARRAY[@]}"; do
+    log "  Creating directories on ${SSH_HOST}..."
+    ssh "${WORKER_USER}@${SSH_HOST}" "
+      # Create HuggingFace cache directory
+      sudo mkdir -p '${HF_CACHE}'
+      sudo chown \$(id -u):\$(id -g) '${HF_CACHE}'
+
+      # Create tiktoken encodings directory
+      mkdir -p '${TIKTOKEN_DIR}'
+
+      # Create SSH staging directory (for MPI keys)
+      mkdir -p /tmp/trtllm-ssh
+    " 2>/dev/null || log "    Warning: Could not create some directories on ${SSH_HOST}"
+  done
+  log "  Worker directories ready"
+fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Step 5: Remove existing stack/containers
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -366,6 +391,46 @@ if [ "${NUM_NODES}" -gt 1 ]; then
   export NCCL_DEBUG NCCL_IB_DISABLE NCCL_NET_GDR_LEVEL NCCL_TIMEOUT
   export NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME NCCL_IB_HCA
 
+  # Verify mount paths exist on all nodes before deploying
+  log "  Verifying mount paths on all nodes..."
+  MOUNT_CHECK_FAILED=false
+
+  # Check local node
+  for path in "${HF_CACHE}" "${TIKTOKEN_DIR}" "/tmp/trtllm-api-config.yml" "/tmp/trtllm-ssh"; do
+    if [ ! -e "${path}" ]; then
+      log "    ERROR: Missing on local: ${path}"
+      MOUNT_CHECK_FAILED=true
+    fi
+  done
+
+  # Check worker nodes
+  for SSH_HOST in "${WORKER_HOST_ARRAY[@]}"; do
+    for path in "${HF_CACHE}" "${TIKTOKEN_DIR}" "/tmp/trtllm-api-config.yml" "/tmp/trtllm-ssh"; do
+      if ! ssh "${WORKER_USER}@${SSH_HOST}" "test -e '${path}'" 2>/dev/null; then
+        log "    ERROR: Missing on ${SSH_HOST}: ${path}"
+        MOUNT_CHECK_FAILED=true
+      fi
+    done
+  done
+
+  if [ "${MOUNT_CHECK_FAILED}" = "true" ]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo " ERROR: Required mount paths missing on one or more nodes!"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo " Docker Swarm requires all bind mount paths to exist on every node."
+    echo " The paths above are missing and must be created."
+    echo ""
+    echo " For HF_CACHE (${HF_CACHE}):"
+    echo "   sudo mkdir -p ${HF_CACHE} && sudo chown \$(id -u):\$(id -g) ${HF_CACHE}"
+    echo ""
+    echo " Run this on each affected node, then re-run this script."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    exit 1
+  fi
+  log "    All mount paths verified"
+
   # Deploy the stack
   docker stack deploy --detach=true -c "${SCRIPT_DIR}/docker-compose.yml" "${STACK_NAME}"
 
@@ -377,8 +442,38 @@ if [ "${NUM_NODES}" -gt 1 ]; then
       log "  All ${NUM_NODES} containers running"
       break
     fi
+
+    # Check for rejected/failed containers (e.g., invalid mount config)
+    REJECTED=$(docker stack ps "${STACK_NAME}" --format "{{.CurrentState}}" 2>/dev/null | grep -c "Rejected" || echo "0")
+    if [ "${REJECTED}" -gt 0 ]; then
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo " ERROR: Containers rejected by Docker Swarm!"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo ""
+      echo " Some containers were rejected. This usually means:"
+      echo "   - Mount paths don't exist on worker nodes"
+      echo "   - GPU resources not visible on worker (run ./setup_swarm.sh)"
+      echo ""
+      echo " Details:"
+      docker stack ps "${STACK_NAME}" --no-trunc 2>/dev/null | head -10
+      echo ""
+      echo " To see full error:"
+      echo "   docker stack ps ${STACK_NAME} --no-trunc"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      exit 1
+    fi
+
     sleep 2
   done
+
+  # Verify we have containers on all expected nodes
+  ACTUAL_RUNNING=$(docker stack ps "${STACK_NAME}" --filter "desired-state=running" --format "{{.Node}}" 2>/dev/null | sort -u | wc -l || echo "0")
+  if [ "${ACTUAL_RUNNING}" -lt "${NUM_NODES}" ]; then
+    log "  WARNING: Only ${ACTUAL_RUNNING} of ${NUM_NODES} nodes have running containers"
+    log "  Checking for issues..."
+    docker stack ps "${STACK_NAME}" 2>/dev/null | head -10
+  fi
 
   # Get container ID (on this node)
   sleep 5

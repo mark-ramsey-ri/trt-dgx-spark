@@ -332,6 +332,38 @@ check_worker_node() {
   else
     print_info "Worker is not in swarm (Swarm: $swarm_status)"
   fi
+
+  # 8. Docker Swarm Mount Paths
+  print_section "8. Docker Swarm Mount Paths"
+  echo "  Checking paths required for Docker Swarm stack..."
+
+  # Load config to get actual paths
+  local hf_cache="${HF_CACHE:-/raid/hf-cache}"
+  local tiktoken_dir="${TIKTOKEN_DIR:-${HOME}/tiktoken_encodings}"
+
+  local mount_paths_ok=true
+
+  if ssh "$SSH_TARGET" "test -d '$hf_cache'" 2>/dev/null; then
+    print_ok "HF_CACHE exists: $hf_cache"
+  else
+    print_fail "HF_CACHE missing: $hf_cache"
+    mount_paths_ok=false
+  fi
+
+  if ssh "$SSH_TARGET" "test -d '$tiktoken_dir'" 2>/dev/null; then
+    print_ok "TIKTOKEN_DIR exists: $tiktoken_dir"
+  else
+    print_fail "TIKTOKEN_DIR missing: $tiktoken_dir"
+    mount_paths_ok=false
+  fi
+
+  if [ "$mount_paths_ok" = "false" ]; then
+    echo ""
+    echo -e "    ${RED}Missing mount paths will cause 'invalid mount config' errors!${NC}"
+    echo "    Run start_cluster.sh (it will create these) or create manually:"
+    echo "      ssh $SSH_TARGET \"sudo mkdir -p $hf_cache && sudo chown \\\$(id -u):\\\$(id -g) $hf_cache\""
+    echo "      ssh $SSH_TARGET \"mkdir -p $tiktoken_dir\""
+  fi
 }
 
 ################################################################################
@@ -471,6 +503,15 @@ quick_check() {
         print_ok "daemon.json: Configured"
       else
         print_fail "daemon.json: NOT configured"
+        all_ok=false
+      fi
+
+      # Check mount paths on worker
+      local hf_cache="${HF_CACHE:-/raid/hf-cache}"
+      if ssh "${WORKER_USER}@${WORKER_HOST}" "test -d '$hf_cache'" 2>/dev/null; then
+        print_ok "Mount paths: HF_CACHE exists"
+      else
+        print_fail "Mount paths: HF_CACHE missing ($hf_cache)"
         all_ok=false
       fi
     else

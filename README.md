@@ -43,6 +43,7 @@ Deploy [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) on a dual-node NVI
 - **Network:** 200Gb/s InfiniBand RoCE between nodes
 - **Storage:** Shared model cache at `/raid/hf-cache` (or configure in `config.env`)
 - **SSH:** Passwordless SSH from head to worker node(s)
+- **Sudo:** Passwordless sudo on **BOTH** head and worker nodes (required for Docker/swarm setup)
 
 ## Prerequisites
 
@@ -94,7 +95,25 @@ Ensure the following ports are open between both nodes:
 - **4789** - Docker Swarm overlay network (UDP)
 - **8355** - TensorRT-LLM API
 
-### 5. Hugging Face Authentication (for gated models)
+### 5. Passwordless Sudo (BOTH nodes)
+
+The setup scripts need to modify Docker configuration and restart services on both nodes. Configure passwordless sudo on **BOTH** head and worker nodes:
+
+```bash
+# Run on EACH node (head AND worker):
+echo "$USER ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/$USER
+sudo chmod 440 /etc/sudoers.d/$USER
+
+# Verify it works:
+sudo -n echo "SUDO_OK"
+```
+
+> **Why is this needed?** The `setup_swarm.sh` script must:
+> - Modify `/etc/docker/daemon.json` to enable GPU resource advertising
+> - Update `/etc/nvidia-container-runtime/config.toml` for swarm support
+> - Restart the Docker daemon on both nodes
+
+### 6. Hugging Face Authentication (for gated models)
 
 Some models (Llama, Gemma, etc.) require Hugging Face authorization:
 
@@ -249,6 +268,7 @@ Key settings in `config.env` or `config.local.env`:
 WORKER_HOST="192.168.7.111"        # Worker Ethernet IP for SSH access
 WORKER_IB_IP="169.254.216.8"       # Worker InfiniBand IP for NCCL/RDMA
 WORKER_USER="<username>"           # SSH username for workers
+HEAD_IP="192.168.6.64"             # Head node Ethernet IP for Docker Swarm
 
 # ┌─────────────────────────────────────────────────────────────────┐
 # │ Model Settings                                                  │
@@ -299,8 +319,11 @@ ip addr show enp1s0f1np1 | grep "inet "
 ```
 
 **Summary:**
-- `WORKER_HOST` = Standard Ethernet IP (e.g., `192.168.7.111`) - used for SSH
-- `WORKER_IB_IP` = InfiniBand IP (e.g., `169.254.216.8`) - used for high-speed GPU communication
+- `WORKER_HOST` = Worker's standard Ethernet IP (e.g., `192.168.7.111`) - used for SSH
+- `WORKER_IB_IP` = Worker's InfiniBand IP (e.g., `169.254.216.8`) - used for high-speed GPU communication
+- `HEAD_IP` = Head node's standard Ethernet IP (e.g., `192.168.6.64`) - used for Docker Swarm
+
+> **Note:** Docker Swarm should use standard Ethernet IPs (not InfiniBand link-local IPs) for reliability. NCCL will still use InfiniBand for GPU-to-GPU transfers regardless of the Swarm network.
 
 ## Switching Models
 

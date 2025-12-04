@@ -28,7 +28,7 @@ services:
       - LIBRARY_PATH=/usr/local/cuda/lib64
     volumes:
       - ${HF_CACHE:-/raid/hf-cache}:/root/.cache/huggingface
-      - ${TIKTOKEN_DIR:-/home/rispark/tiktoken_encodings}:/tiktoken_encodings:ro
+      - ${TIKTOKEN_DIR:-/tmp/tiktoken_encodings}:/tiktoken_encodings:ro
       - /tmp/trtllm-api-config.yml:/tmp/extra-llm-api-config.yml:ro
       - /tmp/trtllm-ssh:/tmp/ssh-stage:ro
       # Mount host's /dev/shm for larger shared memory (shm_size not supported in Swarm)
