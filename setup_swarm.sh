@@ -421,20 +421,20 @@ fi
 
 log "Step 3: Setting up Docker Swarm"
 
-# Auto-detect HEAD_IP from InfiniBand interface (same logic as start_cluster.sh)
-# This ensures we use a routable IP, not a link-local 169.254.x.x address
+# Use HEAD_IP from config, or auto-detect using standard Ethernet
+# Docker Swarm should use routable Ethernet IPs (not InfiniBand link-local)
+# NCCL handles InfiniBand separately for GPU communication
 if [ -z "${HEAD_IP:-}" ]; then
-  if command -v ibdev2netdev >/dev/null 2>&1; then
-    PRIMARY_IB_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | grep "^enp1" | head -1)
-    [ -z "${PRIMARY_IB_IF}" ] && PRIMARY_IB_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | head -1)
-    [ -n "${PRIMARY_IB_IF}" ] && HEAD_IP=$(ip -o addr show "${PRIMARY_IB_IF}" 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | head -1)
-  fi
+  # Use first routable IP (standard Ethernet)
+  HEAD_IP=$(hostname -I | awk '{print $1}')
   if [ -z "${HEAD_IP:-}" ]; then
-    # Fallback to first non-loopback IP
-    HEAD_IP=$(hostname -I | awk '{print $1}')
+    error "Could not auto-detect HEAD_IP. Please set HEAD_IP in config.local.env"
   fi
+  log "  Auto-detected HEAD_IP: ${HEAD_IP}"
+  log "  (Set HEAD_IP in config.local.env to override)"
+else
+  log "  Using configured HEAD_IP: ${HEAD_IP}"
 fi
-log "  Using HEAD_IP: ${HEAD_IP}"
 
 # Check if already in swarm mode
 if docker info 2>/dev/null | grep -q "Swarm: active"; then
