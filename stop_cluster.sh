@@ -181,15 +181,20 @@ if [ -n "${LOCAL_CONTAINERS}" ]; then
   echo ""
 fi
 
-# Confirmation
+# Confirmation. In non-interactive shells (e.g. piped), the default-no branch
+# silently aborts the user's pipeline; auto-confirm there.
 if [ "${FORCE}" != "true" ]; then
-  read -p "Proceed with shutdown? [y/N] " -n 1 -r
-  echo ""
-  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    log "Cancelled."
-    exit 0
+  if [ -t 0 ]; then
+    read -p "Proceed with shutdown? [y/N] " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      log "Cancelled."
+      exit 0
+    fi
+    echo ""
+  else
+    log "Non-interactive shell detected; proceeding with shutdown."
   fi
-  echo ""
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

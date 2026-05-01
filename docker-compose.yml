@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   trtllm:
-    image: ${TRT_IMAGE:-nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc4}
+    image: ${TRT_IMAGE:-nvcr.io/nvidia/tensorrt-llm/release:1.2.1}
     hostname: "{{.Node.Hostname}}"
     environment:
       - HF_TOKEN=${HF_TOKEN:-}

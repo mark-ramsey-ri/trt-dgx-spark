@@ -314,11 +314,11 @@ echo ""
 # Display available models
 echo "Available models:"
 echo ""
-echo "  Multi-Node Models (TP=2, requires 2 DGX Spark nodes):"
+echo "  Multi-Spark Models (require 2+ Sparks, TP scales with N):"
 for i in "${!MODELS[@]}"; do
-  MARKER=""
+  MARKER=" [needs ${MODEL_NODES[$i]} Sparks, TP=${MODEL_TP[$i]}]"
   if [ "${MODELS[$i]}" = "${CURRENT_MODEL}" ]; then
-    MARKER=" [CURRENT]"
+    MARKER=" [CURRENT]${MARKER}"
   fi
   if [ "${MODEL_NEEDS_TOKEN[$i]}" = "true" ]; then
     MARKER="${MARKER} [HF TOKEN]"
@@ -467,20 +467,21 @@ else
   fi
 fi
 
-# Add model configuration
+# Add model configuration. Use ${X:-default} so env var overrides still win
+# (matches the shape used elsewhere in config.env).
 {
   echo ""
   echo "# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "# Model Configuration (set by switch_model.sh)"
   echo "# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "MODEL=\"${NEW_MODEL}\""
-  echo "TENSOR_PARALLEL=\"${NEW_TP}\""
-  echo "NUM_NODES=\"${NEW_NODES}\""
-  echo "GPU_MEMORY_FRACTION=\"${NEW_MEM}\""
-  echo "MAX_NUM_TOKENS=\"${NEW_MAX_TOKENS}\""
-  echo "MAX_BATCH_SIZE=\"${NEW_BATCH_SIZE}\""
-  echo "TRUST_REMOTE_CODE=\"${NEW_TRUST}\""
-  echo "EXTRA_ARGS=\"\""
+  echo "MODEL=\"\${MODEL:-${NEW_MODEL}}\""
+  echo "TENSOR_PARALLEL=\"\${TENSOR_PARALLEL:-${NEW_TP}}\""
+  echo "NUM_NODES=\"\${NUM_NODES:-${NEW_NODES}}\""
+  echo "GPU_MEMORY_FRACTION=\"\${GPU_MEMORY_FRACTION:-${NEW_MEM}}\""
+  echo "MAX_NUM_TOKENS=\"\${MAX_NUM_TOKENS:-${NEW_MAX_TOKENS}}\""
+  echo "MAX_BATCH_SIZE=\"\${MAX_BATCH_SIZE:-${NEW_BATCH_SIZE}}\""
+  echo "TRUST_REMOTE_CODE=\"\${TRUST_REMOTE_CODE:-${NEW_TRUST}}\""
+  echo "EXTRA_ARGS=\"\${EXTRA_ARGS:-}\""
 } >> "${CONFIG_FILE}"
 
 echo "  Configuration saved to: ${CONFIG_FILE}"

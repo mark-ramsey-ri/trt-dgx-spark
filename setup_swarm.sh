@@ -18,10 +18,16 @@ elif [ -f "${SCRIPT_DIR}/config.env" ]; then
   source "${SCRIPT_DIR}/config.env"
 fi
 
-# Worker configuration
+# Worker configuration. WORKER_HOST and WORKER_IB_IP accept space-separated
+# lists for 1-to-N workers; legacy WORKER_IPS is kept for backwards compat.
 WORKER_HOST="${WORKER_HOST:-}"
 WORKER_IB_IP="${WORKER_IB_IP:-${WORKER_IPS:-}}"
 WORKER_USER="${WORKER_USER:-$(whoami)}"
+
+# Mirror legacy WORKER_IPS-only setups (where WORKER_IB_IP gets used for SSH too).
+if [ -z "${WORKER_HOST}" ] && [ -n "${WORKER_IB_IP}" ]; then
+  WORKER_HOST="${WORKER_IB_IP}"
+fi
 
 # Validate worker configuration for multi-node setup
 if [ -z "${WORKER_HOST}" ]; then

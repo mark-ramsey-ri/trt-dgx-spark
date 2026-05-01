@@ -28,15 +28,15 @@ fi
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # Docker
-TRT_IMAGE="${TRT_IMAGE:-nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc4}"
+TRT_IMAGE="${TRT_IMAGE:-nvcr.io/nvidia/tensorrt-llm/release:1.2.1}"
 STACK_NAME="${STACK_NAME:-trtllm-multinode}"
 
 # Model
 MODEL="${MODEL:-nvidia/Qwen3-235B-A22B-FP4}"
-TENSOR_PARALLEL="${TENSOR_PARALLEL:-2}"
-NUM_NODES="${NUM_NODES:-2}"
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-4}"
 MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-32768}"
+# TENSOR_PARALLEL and NUM_NODES default to (1 head + N workers); resolved
+# below once WORKER_HOST_ARRAY is parsed.
 
 # TensorRT-LLM options
 TRT_BACKEND="${TRT_BACKEND:-pytorch}"
@@ -57,7 +57,9 @@ NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-5}"
 NCCL_TIMEOUT="${NCCL_TIMEOUT:-1200000}"  # 20 minutes in ms (large models need time to init)
 
-# Worker configuration
+# Worker configuration. WORKER_HOST and WORKER_IB_IP are space-separated lists
+# with 1:1 positional correspondence (a single value is just N=1).
+# Legacy WORKER_IPS is supported for backwards compat.
 WORKER_HOST="${WORKER_HOST:-}"
 WORKER_IB_IP="${WORKER_IB_IP:-${WORKER_IPS:-}}"
 WORKER_USER="${WORKER_USER:-$(whoami)}"
@@ -78,16 +80,18 @@ if [ -z "${HEAD_IP:-}" ]; then
   fi
 fi
 
-# Auto-detect network interfaces
-# For Docker Swarm overlay networking, containers use eth0/eth1 instead of host interfaces
+# Auto-detect network interfaces.
+# Multi-node uses eth0 (Docker Swarm overlay network); single-node uses the
+# host's primary IB interface. Key off WORKER_HOST being non-empty since
+# NUM_NODES isn't resolved until after worker arrays are parsed below.
 if [ -z "${NCCL_SOCKET_IFNAME:-}" ]; then
-  if [ "${NUM_NODES:-1}" -gt 1 ]; then
-    # Multi-node: Use eth0 (overlay network interface inside containers)
+  if [ -n "${WORKER_HOST:-}" ]; then
+    # Multi-Spark: Use eth0 (overlay network interface inside containers)
     # eth0 = overlay network (10.0.x.x), eth1 = docker_gwbridge (172.19.x.x, local only)
     NCCL_SOCKET_IFNAME="eth0"
     GLOO_SOCKET_IFNAME="eth0"
   elif command -v ibdev2netdev >/dev/null 2>&1; then
-    # Single-node with host networking: detect host interface
+    # Single-Spark with host networking: detect host interface
     PRIMARY_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | grep "^enp1" | head -1)
     [ -z "${PRIMARY_IF}" ] && PRIMARY_IF=$(ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $5}' | head -1)
     NCCL_SOCKET_IFNAME="${PRIMARY_IF}"
@@ -156,14 +160,74 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Convert worker IP lists to arrays
+# Convert worker IP lists to arrays. read -ra on an empty string yields empty.
 read -ra WORKER_HOST_ARRAY <<< "${WORKER_HOST}"
 read -ra WORKER_IB_IP_ARRAY <<< "${WORKER_IB_IP}"
+WORKER_COUNT="${#WORKER_HOST_ARRAY[@]}"
 
-# If WORKER_HOST is empty but WORKER_IB_IP has values, use IB IPs for SSH
-if [ ${#WORKER_HOST_ARRAY[@]} -eq 0 ] && [ ${#WORKER_IB_IP_ARRAY[@]} -gt 0 ]; then
+# Backwards-compat: legacy single-worker setups sometimes only set WORKER_IB_IP
+# (via WORKER_IPS) and rely on it for SSH. Mirror it back into WORKER_HOST.
+if [ "${WORKER_COUNT}" -eq 0 ] && [ "${#WORKER_IB_IP_ARRAY[@]}" -gt 0 ]; then
   log "Warning: WORKER_HOST not set, using WORKER_IB_IP (${WORKER_IB_IP}) for SSH"
-  read -ra WORKER_HOST_ARRAY <<< "${WORKER_IB_IP}"
+  WORKER_HOST_ARRAY=("${WORKER_IB_IP_ARRAY[@]}")
+  WORKER_HOST="${WORKER_IB_IP}"
+  WORKER_COUNT="${#WORKER_HOST_ARRAY[@]}"
+fi
+
+# Validate WORKER_IB_IP cardinality: must match WORKER_HOST when given.
+if [ "${#WORKER_IB_IP_ARRAY[@]}" -gt 0 ] && [ "${#WORKER_IB_IP_ARRAY[@]}" -ne "${WORKER_COUNT}" ]; then
+  echo "ERROR: WORKER_IB_IP has ${#WORKER_IB_IP_ARRAY[@]} entries but WORKER_HOST has ${WORKER_COUNT}."
+  echo "       They must be 1:1 positional: WORKER_HOST=\"a b c\" needs WORKER_IB_IP=\"x y z\"."
+  exit 1
+fi
+
+# When WORKER_IB_IP is unset, mirror WORKER_HOST so per-worker NCCL IPs are
+# always available downstream.
+if [ "${#WORKER_IB_IP_ARRAY[@]}" -eq 0 ] && [ "${WORKER_COUNT}" -gt 0 ]; then
+  WORKER_IB_IP_ARRAY=("${WORKER_HOST_ARRAY[@]}")
+  WORKER_IB_IP="${WORKER_HOST}"
+fi
+
+# Defaults that scale with cluster size: 1 head + N workers, 1 GPU per Spark.
+NUM_NODES="${NUM_NODES:-$((WORKER_COUNT + 1))}"
+TENSOR_PARALLEL="${TENSOR_PARALLEL:-${NUM_NODES}}"
+
+# Override-respect: --head-only forces NUM_NODES=1 and ignores any WORKER_HOST.
+if [ "${HEAD_ONLY}" = "true" ]; then
+  NUM_NODES=1
+  WORKER_HOST_ARRAY=()
+  WORKER_IB_IP_ARRAY=()
+  WORKER_COUNT=0
+fi
+
+# Multi-Spark requires workers; surface a clear error if NUM_NODES>1 and none.
+if [ "${WORKER_COUNT}" -eq 0 ] && [ "${NUM_NODES}" -gt 1 ] && [ "${HEAD_ONLY}" != "true" ]; then
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo " Worker Configuration Required"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  echo "NUM_NODES=${NUM_NODES} but no workers configured. Pick one:"
+  echo ""
+  echo "  A) Configure workers (space-separated for >1):"
+  echo "       export WORKER_HOST=\"192.168.x.x [192.168.x.y ...]\"     # Ethernet IPs (SSH)"
+  echo "       export WORKER_IB_IP=\"169.254.x.x [169.254.x.y ...]\"    # InfiniBand IPs (NCCL)"
+  echo "  B) Single-Spark mode: re-run with NUM_NODES=1 TENSOR_PARALLEL=1"
+  echo "  C) Run --head-only (will hang waiting for ${NUM_NODES} workers)"
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  exit 1
+fi
+
+# Pre-flight SSH connectivity check (one round trip per worker beats a partial
+# launch where worker N hangs SSH).
+if [ "${HEAD_ONLY}" != "true" ] && [ "${WORKER_COUNT}" -gt 0 ]; then
+  for ip in "${WORKER_HOST_ARRAY[@]}"; do
+    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        "${WORKER_USER}@${ip}" "echo ok" >/dev/null 2>&1; then
+      error "Cannot SSH to ${WORKER_USER}@${ip}. Check SSH keys (try: ssh-copy-id ${WORKER_USER}@${ip})."
+    fi
+  done
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -177,17 +241,24 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 log "Configuration:"
 log "  Model:             ${MODEL}"
-log "  Tensor Parallel:   ${TENSOR_PARALLEL}"
-log "  Nodes:             ${NUM_NODES}"
+log "  Tensor Parallel:   ${TENSOR_PARALLEL} (across all nodes)"
+log "  Nodes:             ${NUM_NODES} (1 head + ${WORKER_COUNT} worker(s))"
 log "  Max Batch Size:    ${MAX_BATCH_SIZE}"
 log "  Max Tokens:        ${MAX_NUM_TOKENS}"
 log "  Backend:           ${TRT_BACKEND}"
+log "  Image:             ${TRT_IMAGE}"
 log ""
 log "Network:"
 log "  Head IP:         ${HEAD_IP}"
 log "  API Port:        ${TRT_PORT}"
-if [ ${#WORKER_HOST_ARRAY[@]} -gt 0 ]; then
-  log "  Workers:         ${WORKER_HOST_ARRAY[*]}"
+if [ "${WORKER_COUNT}" -gt 0 ]; then
+  for i in "${!WORKER_HOST_ARRAY[@]}"; do
+    if [ "${WORKER_IB_IP_ARRAY[i]}" != "${WORKER_HOST_ARRAY[i]}" ]; then
+      log "  Worker $((i+1)):        ${WORKER_HOST_ARRAY[i]} (SSH) / ${WORKER_IB_IP_ARRAY[i]} (NCCL)"
+    else
+      log "  Worker $((i+1)):        ${WORKER_HOST_ARRAY[i]}"
+    fi
+  done
 fi
 echo ""
 
@@ -661,11 +732,12 @@ fi
 log "Step 10: Waiting for cluster to be ready"
 
 if [ "${NUM_NODES}" -gt 1 ]; then
-  MAX_WAIT=600
-  log "  Multi-node cluster - waiting up to 10 minutes..."
+  # 10 min base + 2 min per worker; large clusters bootstrap slower.
+  MAX_WAIT=$((600 + 120 * WORKER_COUNT))
+  log "  Multi-Spark cluster (${NUM_NODES} nodes) - waiting up to $((MAX_WAIT / 60)) minutes..."
 else
   MAX_WAIT=300
-  log "  Single-node - waiting up to 5 minutes..."
+  log "  Single Spark - waiting up to 5 minutes..."
 fi
 
 READY=false
